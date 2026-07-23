@@ -31,9 +31,9 @@ jobs:
           echo "Comment author: ${{ github.event.comment.user.login || 'No user' }}"
 
       - name: Checkout Repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # Fetch all history for all branches and tags
+          fetch-depth: 0 # Fetch all history for all branches and tags
 
       - name: Extract review parameters
         id: extract
@@ -71,13 +71,13 @@ jobs:
 
       - name: AI Doc Reviewer
         uses: qiancai/ai-codereviewer@test-gpt
-        continue-on-error: false  # Ensure workflow fails if the action fails
+        continue-on-error: false # Ensure workflow fails if the action fails
         with:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          API_PROVIDER: "deepseek"  # or "openai" if you want to use OpenAI
+          API_PROVIDER: "deepseek" # or "openai" if you want to use OpenAI
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          DEEPSEEK_API_MODEL: "deepseek-chat"  # Updated model name
-          exclude: "**/*.json"  # Optional: exclude patterns separated by commas
+          DEEPSEEK_API_MODEL: "deepseek-chat" # Updated model name
+          exclude: "**/*.json" # Optional: exclude patterns separated by commas
           REVIEW_MODE: ${{ steps.extract.outputs.REVIEW_MODE || 'default' }}
           COMMIT_SHA: ${{ steps.extract.outputs.COMMIT_SHA || '' }}
           BASE_SHA: ${{ steps.extract.outputs.BASE_SHA || '' }}

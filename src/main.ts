@@ -1,979 +1,474 @@
-import { readFileSync, existsSync } from "fs";
 import * as core from "@actions/core";
-import OpenAI from "openai";
 import { Octokit } from "@octokit/rest";
-import parseDiff, { Chunk, File } from "parse-diff";
+import parseDiff, { File } from "parse-diff";
 import minimatch from "minimatch";
+import { readFileSync } from "fs";
 import path from "path";
+import { Config, loadConfig, validateApiKeys } from "./config";
+import { buildCommentableLines } from "./context";
+import { parseGlossary, runChecks } from "./checks";
+import { CheckFile, TermRule } from "./checks/types";
+import {
+  getDiff,
+  getFileContent,
+  getPRDetails,
+  isCommentTrigger,
+  isPermissionError,
+  listReviewComments,
+  postIssueComment,
+  postReview,
+  readEventData,
+  upsertSummaryComment,
+} from "./github";
+import { detectLanguage, loadStyleGuide } from "./prompts";
+import { digestToText, runDigest } from "./pipeline/digest";
+import { runCrosscheck } from "./pipeline/crosscheck";
+import { reviewFile } from "./pipeline/review";
+import { runVerify } from "./pipeline/verify";
+import {
+  dedupeAgainstExisting,
+  dedupeWithinBatch,
+  formatBody,
+  validateFindings,
+} from "./posting";
+import { Finding, PRDetails } from "./types";
+import { mapPool } from "./util/pool";
 
-const GITHUB_TOKEN: string = core.getInput("GITHUB_TOKEN");
-const API_PROVIDER: string = core.getInput("API_PROVIDER") || "openai";
-const OPENAI_API_KEY: string = core.getInput("OPENAI_API_KEY");
-const OPENAI_API_MODEL = core.getInput("OPENAI_API_MODEL");
-const DEEPSEEK_API_KEY: string = core.getInput("DEEPSEEK_API_KEY");
-const DEEPSEEK_API_MODEL = core.getInput("DEEPSEEK_API_MODEL");
-const REVIEW_MODE: string = core.getInput("REVIEW_MODE") || "default";
-const COMMIT_SHA: string = core.getInput("COMMIT_SHA") || "";
-const BASE_SHA: string = core.getInput("BASE_SHA") || "";
-const HEAD_SHA: string = core.getInput("HEAD_SHA") || "";
-const PROMPT_PATH: string = core.getInput("PROMPT_PATH") || "";
-// ALLOWED_USERS is no longer needed as permission checking is handled at the workflow level
-// const ALLOWED_USERS: string[] = core.getInput("ALLOWED_USERS").split(",").map(u => u.trim());
-
-const octokit = new Octokit({ auth: GITHUB_TOKEN });
-
-// Initialize OpenAI client if using OpenAI
-const openai = API_PROVIDER === "openai" 
-  ? new OpenAI({ apiKey: OPENAI_API_KEY })
-  : null;
-
-// For Deepseek API, we'll use fetch directly since there's no official SDK
-// We'll implement the Deepseek API calls in the getAIResponse function
-
-interface PRDetails {
-  owner: string;
-  repo: string;
-  pull_number: number;
-  title: string;
-  description: string;
-}
-
-async function getPRDetails(): Promise<PRDetails> {
-  try {
-    console.log("GITHUB_EVENT_PATH:", process.env.GITHUB_EVENT_PATH);
-    const eventPath = process.env.GITHUB_EVENT_PATH || "";
-    if (!eventPath) {
-      throw new Error("GITHUB_EVENT_PATH environment variable is not set");
-    }
-
-    const eventData = JSON.parse(readFileSync(eventPath, "utf8"));
-    console.log("Event type:", process.env.GITHUB_EVENT_NAME);
-    
-    if (process.env.GITHUB_EVENT_NAME === "issue_comment") {
-      if (!eventData.issue || !eventData.issue.pull_request) {
-        throw new Error("Comment is not on a pull request");
-      }
-      
-      const prUrl = eventData.issue.pull_request.url;
-      console.log("PR URL from comment:", prUrl);
-      
-      const urlParts = prUrl.split('/');
-      const number = parseInt(urlParts[urlParts.length - 1], 10);
-      const repo = urlParts[urlParts.length - 3];
-      const owner = urlParts[urlParts.length - 4];
-      
-      console.log(`Extracted PR info - owner: ${owner}, repo: ${repo}, number: ${number}`);
-      
-      const prResponse = await octokit.pulls.get({
-        owner,
-        repo,
-        pull_number: number,
-      });
-      
-      return {
-        owner,
-        repo,
-        pull_number: number,
-        title: prResponse.data.title ?? "",
-        description: prResponse.data.body ?? "",
-      };
-    }
-    
-    if (!eventData.repository || !eventData.repository.owner) {
-      console.log("Event data:", JSON.stringify(eventData, null, 2));
-      throw new Error("Invalid event data: missing repository information");
-    }
-    
-    const repository = eventData.repository;
-    const number = eventData.number || eventData.pull_request?.number;
-    
-    if (!number) {
-      console.log("Event data:", JSON.stringify(eventData, null, 2));
-      throw new Error("Invalid event data: missing pull request number");
-    }
-    
-    console.log(`PR info - owner: ${repository.owner.login}, repo: ${repository.name}, number: ${number}`);
-    
-    const prResponse = await octokit.pulls.get({
-      owner: repository.owner.login,
-      repo: repository.name,
-      pull_number: number,
-    });
-    
-    return {
-      owner: repository.owner.login,
-      repo: repository.name,
-      pull_number: number,
-      title: prResponse.data.title ?? "",
-      description: prResponse.data.body ?? "",
-    };
-  } catch (error) {
-    console.error("Error in getPRDetails:", error);
-    if (error instanceof Error) {
-      throw new Error(`Failed to get PR details: ${error.message}`);
-    }
-    throw new Error(`Failed to get PR details: ${String(error)}`);
-  }
-}
-
-async function getDiff(
-  owner: string,
-  repo: string,
-  pull_number: number
-): Promise<string | null> {
-  const response = await octokit.pulls.get({
-    owner,
-    repo,
-    pull_number,
-    mediaType: { format: "diff" },
-  });
-  // @ts-expect-error - response.data is a string
-  return response.data;
-}
-
-async function analyzeCode(
-  parsedDiff: File[],
-  prDetails: PRDetails
-): Promise<Array<{ body: string; path: string; line: number }>> {
-  const comments: Array<{ body: string; path: string; line: number }> = [];
-  
-  console.log(`Analyzing ${parsedDiff.length} files from diff:`);
-  for (const file of parsedDiff) {
-    console.log(`- File: ${file.to || '[deleted]'}, chunks: ${file.chunks?.length || 0}`);
-  }
-
-  for (const file of parsedDiff) {
-    const filePath = file.to;
-    if (!filePath || filePath === "/dev/null") continue; // Ignore deleted files and files without path
-    
-    for (const chunk of file.chunks) {
-      const { prompt } = createPrompt(file, chunk, prDetails);
-      
-      // Get starting line number safely by checking the type of change
-      const firstChange = chunk.changes[0] || {};
-      let startLine = 'unknown';
-      if ('ln' in firstChange) {
-        startLine = String(firstChange.ln);
-      } else if ('ln2' in firstChange) {
-        startLine = String(firstChange.ln2);
-      }
-      
-      console.log(`Sending to AI - File: ${filePath}, Chunk starting at line: ${startLine}`);
-      console.log(`AI Prompt preview (first 500 chars): ${prompt.substring(0, 500)}...`);
-      
-      const aiResponse = await getAIResponse(prompt);
-      if (aiResponse) {
-        const newComments = createComment(file, chunk, aiResponse);
-        if (newComments) {
-          comments.push(...newComments);
-        }
-      }
-    }
-  }
-  return comments;
-}
-
-function createPrompt(file: File, chunk: Chunk, prDetails: PRDetails): {prompt: string} {
-  // Default prompt template that will be used if the file doesn't exist
-  const defaultPromptTemplate = `As a technical writer who has profound knowledge, your task is to review pull requests of user documentation.
-
-IMPORTANT: You MUST follow these formatting instructions exactly:
-1. Your response MUST be a valid JSON object with the following structure:
-   {"reviews": [{"lineNumber": <line_number>, "reviewComment": "<review comment>", "suggestion": "<improved version of the original line>"}]}
-2. Do NOT include any markdown code blocks (like \`\`\`json) around your JSON.
-3. Ensure all JSON keys and values are properly quoted with double quotes.
-4. Escape any double quotes within string values with a backslash (\\").
-5. Do NOT include any explanations or text outside of the JSON object.
-
-Review Guidelines:
-- Do not give positive comments or compliments.
-- Do not improve the wording of UI strings or messages returned by CLI.
-- Focus on improving the clarity, accuracy, and readability of the content.
-- Ensure the documentation is easy to understand for TiDB users.
-- Review not just the wording but also the logic and structure of the content.
-- Review the document in the context of the overall user experience and functionality described.
-- Provide "reviews" ONLY if there is something to improve, otherwise "reviews" should be an empty array.
-- Write the review comment in the language of the documentation.
-- For EVERY review comment of a specific line, "suggestion" MUST be the improved version of the original line. If the beginning of the original line contains Markdown syntax such as blank spaces for indentation, "-", "+", "*" for unordered list, or ">" for notes, keep them unchanged.
-
-Example of a valid response:
-
-{"reviews": [{"lineNumber": 42, "reviewComment": "The sentence is not clear enough. It is recommended to clarify the relationship between compression efficiency and compression rate, and to supplement the explanation of the default value.", "suggestion": "Set the compression efficiency of the lz4 compression algorithm used when writing raft log files to raft-engine, ranging from 1 to 16. The lower the value, the higher the compression rate, but the lower the compression rate; the higher the value, the lower the compression rate, but the higher the compression rate. The default value is 1, which means to prioritize compression rate."}]}
-
-Review the following diff in the file "\${filename}" and take the pull request title and description into account when writing the response.
-
-Pull request title: \${title}
-Pull request description:
-
----
-\${description}
----
-
-Git diff to review:
-
-\`\`\`diff
-\${diff_content}
-\${diff_changes}
-\`\`\``;
-
-  try {
-    // Read the template file from the configured path
-    // If it's a relative path, resolve it from the current working directory
-    const templatePath = path.isAbsolute(PROMPT_PATH)
-      ? PROMPT_PATH
-      : path.resolve(process.cwd(), PROMPT_PATH);
-    
-    try {
-      // Check if file exists before trying to read it
-      readFileSync(templatePath, { encoding: 'utf8', flag: 'r' });
-      console.log(`✅ Using custom prompt template from: ${templatePath}`);
-      core.info(`Using custom prompt template from: ${templatePath}`);
-      let template = readFileSync(templatePath, 'utf8');
-      
-      // Replace placeholders with actual values - using global replacement
-      template = template
-        .replace(/\${filename}/g, file.to || '')
-        .replace(/\${title}/g, prDetails.title)
-        .replace(/\${description}/g, prDetails.description)
-        .replace(/\${diff_content}/g, chunk.content)
-        .replace(/\${diff_changes}/g, chunk.changes
-          // @ts-expect-error - ln and ln2 exists where needed
-          .map((c) => `${c.ln ? c.ln : c.ln2} ${c.content}`)
-          .join("\n"));
-      
-      return { prompt: template };
-    } catch (fileError) {
-      // File doesn't exist or can't be read, fall back to default prompt
-      console.log(`⚠️ Custom prompt file not found at: ${templatePath}. Using default prompt.`);
-      core.warning(`Custom prompt file not found at: ${templatePath}. Using default prompt.`);
-      
-      // Use the default prompt template
-      let template = defaultPromptTemplate;
-      
-      // Replace placeholders with actual values - using global replacement
-      template = template
-        .replace(/\${filename}/g, file.to || '')
-        .replace(/\${title}/g, prDetails.title)
-        .replace(/\${description}/g, prDetails.description)
-        .replace(/\${diff_content}/g, chunk.content)
-        .replace(/\${diff_changes}/g, chunk.changes
-          // @ts-expect-error - ln and ln2 exists where needed
-          .map((c) => `${c.ln ? c.ln : c.ln2} ${c.content}`)
-          .join("\n"));
-      
-      return { prompt: template };
-    }
-  } catch (error) {
-    console.error(`Error in createPrompt:`, error);
-    throw new Error(`Failed to create prompt: ${error instanceof Error ? error.message : String(error)}`);
-  }
-}
-
-async function getAIResponse(prompt: string): Promise<Array<{
-  lineNumber: string;
-  reviewComment: string;
-  suggestion: string;
-}> | null> {
-  if (API_PROVIDER === "openai") {
-    return getOpenAIResponse(prompt);
-  } else if (API_PROVIDER === "deepseek") {
-    try {
-      const deepseekResponse = await getDeepseekResponse(prompt);
-      if (deepseekResponse !== null) {
-        return deepseekResponse;
-      }
-      
-      // If Deepseek API fails and OpenAI API key is available, try OpenAI as fallback
-      if (OPENAI_API_KEY) {
-        console.log("Deepseek API failed, falling back to OpenAI...");
-        return getOpenAIResponse(prompt);
-      }
-      return null;
-    } catch (error) {
-      console.error("Error with Deepseek API, checking for fallback:", error);
-      // If OpenAI API key is available, try OpenAI as fallback
-      if (OPENAI_API_KEY) {
-        console.log("Falling back to OpenAI...");
-        return getOpenAIResponse(prompt);
-      }
-      return null;
-    }
-  } else {
-    console.error(`Unsupported API provider: ${API_PROVIDER}`);
-    return null;
-  }
-}
-
-async function getOpenAIResponse(prompt: string): Promise<Array<{
-  lineNumber: string;
-  reviewComment: string;
-  suggestion: string;
-}> | null> {
-  if (!openai) {
-    console.error("OpenAI client not initialized");
-    return null;
-  }
-
-  const queryConfig = {
-    model: OPENAI_API_MODEL,
-    temperature: 0.1,
-    max_tokens: 800,
-    top_p: 1,
-    frequency_penalty: 0,
-    presence_penalty: 0,
-  };
-
-  try {
-    // Check if the model supports the JSON response format
-    const supportsJsonFormat = OPENAI_API_MODEL.includes("gpt-4-turbo") || 
-                              OPENAI_API_MODEL.includes("gpt-4-0125") || 
-                              OPENAI_API_MODEL.includes("gpt-4-1106") || 
-                              OPENAI_API_MODEL.includes("gpt-3.5-turbo-1106");
-
-    const response = await openai.chat.completions.create({
-      ...queryConfig,
-      // Only add response_format if the model supports it
-      ...(supportsJsonFormat
-        ? { response_format: { type: "json_object" } }
-        : {}),
-      messages: [
-        {
-          role: "system",
-          content: "You are an expert technical writer who provides detailed, helpful documentation reviews in JSON format."
-        },
-        {
-          role: "user",
-          content: prompt
-        }
-      ]
-    });
-
-    const res = response.choices[0].message?.content?.trim() || "{}";
-    console.log("AI response:", res.substring(0, 100) + (res.length > 100 ? "..." : ""));
-    
-    // Try several approaches to extract valid JSON
-    
-    // First, try direct parsing
-    try {
-      const parsed = JSON.parse(res);
-      if (parsed.reviews && Array.isArray(parsed.reviews)) {
-        return parsed.reviews;
-      } else {
-        console.log("Response doesn't contain valid reviews array:", res);
-      }
-    } catch (parseError) {
-      console.error("Error parsing OpenAI response as JSON:", parseError);
-    }
-    
-    // Second, look for JSON-like patterns in the response
-    try {
-      const jsonRegex = /\{(?:"reviews"|'reviews'):\s*\[(.*?)\]\}/s;
-      const match = res.match(jsonRegex);
-      if (match) {
-        const jsonString = match[0].replace(/'/g, '"');
-        const parsed = JSON.parse(jsonString);
-        if (parsed.reviews && Array.isArray(parsed.reviews)) {
-          return parsed.reviews;
-        }
-      }
-    } catch (regexParseError) {
-      console.error("Failed to extract JSON with regex:", regexParseError);
-    }
-    
-    // Finally, try to extract from code blocks
-    try {
-      const codeBlockRegex = /```(?:json)?\s*(\{[\s\S]*?\})\s*```/;
-      const match = res.match(codeBlockRegex);
-      if (match && match[1]) {
-        const jsonString = match[1];
-        const parsed = JSON.parse(jsonString);
-        if (parsed.reviews && Array.isArray(parsed.reviews)) {
-          return parsed.reviews;
-        }
-      }
-    } catch (blockParseError) {
-      console.error("Failed to extract JSON from code block:", blockParseError);
-    }
-    
-    console.error("All JSON parsing approaches failed");
-    return [];
-    
-  } catch (error) {
-    console.error("Error with OpenAI API:", error);
-    return [];
-  }
-}
-
-async function getDeepseekResponse(prompt: string): Promise<Array<{
-  lineNumber: string;
-  reviewComment: string;
-  suggestion: string;
-}> | null> {
-  if (!DEEPSEEK_API_KEY) {
-    console.error("DEEPSEEK_API_KEY is not set");
-    return null;
-  }
-
-  //console.log("Calling Deepseek API...");
-  //console.log("Available Deepseek models: deepseek-chat, deepseek-coder");
-  
-  const requestBody = {
-    model: DEEPSEEK_API_MODEL,
-    messages: [
-      {
-        role: "user",
-        content: prompt
-      }
-    ],
-    temperature: 0.2,
-    max_tokens: 800,
-    top_p: 1,
-    frequency_penalty: 0,
-    presence_penalty: 0
-  };
-  
-  //console.log(`Using Deepseek model: ${DEEPSEEK_API_MODEL}`);
-  //console.log("Request body structure:", JSON.stringify({
-  //  model: DEEPSEEK_API_MODEL,
-  //  messages: [{role: "user", content: "prompt content (truncated)"}],
-  //  temperature: 0.2,
-  //  max_tokens: 800
-  //}));
-  
-  const response = await fetch("https://api.deepseek.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${DEEPSEEK_API_KEY}`
-    },
-    body: JSON.stringify(requestBody)
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    console.error(`Deepseek API error response: ${errorText}`);
-    throw new Error(`Deepseek API error: ${response.status} ${response.statusText}\nDetails: ${errorText}`);
-  }
-
-  const data = await response.json();
-  console.log("Deepseek API response received");
-  
-  // Extract the content from the response
-  const content = data.choices?.[0]?.message?.content;
-  if (!content) {
-    console.error("No content in Deepseek response");
-    return null;
-  }
-
-  // Print the content and add a new line
-  console.log("Deepseek API response content:", content, "\n");
-  
-  try {
-    // First attempt: try to parse the entire content as JSON
-    try {
-      const parsedJson = JSON.parse(content);
-      if (parsedJson && parsedJson.reviews) {
-        return parsedJson.reviews;
-      }
-    } catch (parseError) {
-      console.error("Error parsing Deepseek response as JSON:", parseError);
-    }
-    
-    // Second attempt: try to extract JSON from markdown code blocks
-    const jsonBlockRegex = /```(?:json)?\s*(\{[\s\S]*?\})\s*```/;
-    const jsonMatch = content.match(jsonBlockRegex);
-    
-    if (jsonMatch && jsonMatch[1]) {
-      try {
-        const parsedJson = JSON.parse(jsonMatch[1]);
-        if (parsedJson && parsedJson.reviews) {
-          return parsedJson.reviews;
-        }
-      } catch (blockParseError) {
-        console.error("Failed to parse JSON block:", blockParseError);
-      }
-    }
-    
-    console.error("Could not extract valid JSON from response");
-    return null;
-  } catch (error) {
-    console.error("Error processing Deepseek response:", error);
-    return null;
-  }
-}
-
-function createComment(
-  file: File,
-  chunk: Chunk,
-  aiResponses: Array<{
-    lineNumber: string;
-    reviewComment: string;
-    suggestion: string;
-  }>
-): Array<{ body: string; path: string; line: number }> {
-  if (!file.to) return [];
-  
-  const filePath = file.to;
-  console.log(`Processing file: ${filePath}`);
-  
-  return aiResponses.map((aiResponse: { lineNumber: string; reviewComment: string; suggestion: string }) => {
-    const lineNum = Number(aiResponse.lineNumber);
-    console.log(`Processing suggestion for line ${lineNum}`);
-    console.log(`Original suggestion: "${aiResponse.suggestion.substring(0, 100)}..."`);
-    
-    // Check if the suggestion text already has leading whitespace
-    const suggestionHasLeadingSpace = aiResponse.suggestion.match(/^\s+/);
-    if (suggestionHasLeadingSpace) {
-      console.log(`Suggestion already has leading space: '${suggestionHasLeadingSpace[0].replace(/ /g, '·')}'`);
-      return {
-        body: `${aiResponse.reviewComment}\n\n\`\`\`\`suggestion\n${aiResponse.suggestion}\n\`\`\`\``,
-        path: filePath,
-        line: lineNum,
-      };
-    }
-    
-    // Extract the original line indentation from the diff content
-    let originalIndent = '';
-    
-    // Look for the line in the diff chunks
-    console.log(`Looking for line ${lineNum} in diff chunks`);
-    // Log all changes in the chunk for debugging
-    if (chunk.changes) {
-      console.log(`Chunk has ${chunk.changes.length} changes. Examining for indentation...`);
-      
-      // Examine lines to find the correct indentation
-      for (const change of chunk.changes) {
-        // Get the line number from the change (ln for deletions, ln2 for additions or context)
-        // Use any type assertion to fix TS errors as parse-diff types are incomplete
-        const changeLine = (change as any).ln || (change as any).ln2;
-        
-        // Only look at addition lines (starting with +) to get indentation
-        if (changeLine === lineNum && change.content.startsWith('+')) {
-          console.log(`Found the exact line ${lineNum} in diff: "${change.content}"`);
-          
-          // Remove the + character before checking for indentation
-          const contentWithoutDiffMarker = change.content.substring(1);
-          console.log(`Content after removing diff marker: "${contentWithoutDiffMarker}"`);
-          
-          // Extract indentation from the line content after removing diff marker
-          const indentMatch = contentWithoutDiffMarker.match(/^(\s+)/);
-          if (indentMatch) {
-            originalIndent = indentMatch[0];
-            console.log(`Extracted indentation from diff: '${originalIndent.replace(/ /g, '·')}' (${originalIndent.length} spaces)`);
-            break;
-          } else {
-            console.log(`Line ${lineNum} found in diff but has no leading whitespace after diff marker`);
-          }
-        }
-      }
-    } else {
-      console.log(`No changes found in chunk`);
-    }
-    
-    // Apply indentation to suggestion text
-    let suggestionText = aiResponse.suggestion;
-    if (originalIndent) {
-      // If suggestion doesn't start with the original indentation, add it
-      if (!suggestionText.startsWith(originalIndent)) {
-        suggestionText = originalIndent + suggestionText.trimStart();
-        console.log(`Added indentation for line ${lineNum}. Result: '${suggestionText.substring(0, Math.min(50, suggestionText.length))}...'`);
-      } else {
-        console.log(`Suggestion already has correct indentation, keeping as-is`);
-      }
-    } else {
-      console.log(`No indent found for line ${lineNum}, using suggestion as-is`);
-    }
-    
-    return {
-      body: `${aiResponse.reviewComment}\n\n\`\`\`\`suggestion\n${suggestionText}\n\`\`\`\``,
-      path: filePath,
-      line: lineNum,
-    };
-  });
-}
-
-async function createReviewComment(
-  owner: string,
-  repo: string,
-  pull_number: number,
-  comments: Array<{ body: string; path: string; line: number }>
-): Promise<void> {
-  try {
-    await octokit.pulls.createReview({
-      owner,
-      repo,
-      pull_number,
-      comments,
-      event: "COMMENT",
-    });
-  } catch (error) {
-    console.error("Error creating review comment:", error);
-    
-    // If we get "Resource not accessible by integration" error, try to post a comment instead
-    if (error instanceof Error && error.message.includes("Resource not accessible by integration")) {
-      console.log("Permissions issue detected. Attempting to post a regular comment instead...");
-      
-      const commentBody = `### AI Review Comments\n\n${comments.map(c => 
-        `**File:** ${c.path}, **Line:** ${c.line}\n${c.body}\n\n---\n`
-      ).join('\n')}`;
-      
-      await octokit.issues.createComment({
-        owner,
-        repo,
-        issue_number: pull_number,
-        body: commentBody
-      });
-    } else {
-      throw error;
-    }
-  }
-}
-
-// Helper function to get the line number from a change
-function getChangeLineNumber(change: any, lineNumber: number): boolean {
-  if (change.type === 'add' && change.ln === lineNumber) {
-    return true;
-  } else if (change.type === 'normal' && change.ln2 === lineNumber) {
-    return true;
-  } else if (change.type === 'del' && change.ln === lineNumber) {
-    return true;
-  }
-  return false;
-}
-
-async function main() {
-  try {
-    // Validate API provider configuration
-    if (API_PROVIDER === "openai" && !OPENAI_API_KEY) {
-      core.setFailed("OPENAI_API_KEY is required when API_PROVIDER is set to 'openai'");
-      return;
-    }
-    
-    if (API_PROVIDER === "deepseek" && !DEEPSEEK_API_KEY) {
-      core.setFailed("DEEPSEEK_API_KEY is required when API_PROVIDER is set to 'deepseek'");
-      return;
-    }
-
-    const prDetails = await getPRDetails();
-    let diff: string | null;
-    const eventData = JSON.parse(
-      readFileSync(process.env.GITHUB_EVENT_PATH ?? "", "utf8")
-    );
-    
-    // Check if the comment is triggered
-    const isCommentTrigger = process.env.GITHUB_EVENT_NAME === "issue_comment";
-    
-    if (isCommentTrigger) {
-
-      const commentUser = eventData.comment.user.login;
-      
-      console.log("REVIEW_MODE from input:", REVIEW_MODE);
-      console.log("COMMIT_SHA from input:", COMMIT_SHA);
-      console.log("BASE_SHA from input:", BASE_SHA);
-      console.log("HEAD_SHA from input:", HEAD_SHA);
-      console.log("Raw comment body:", eventData.comment.body);
-      
-      // Handle invalid review mode
-      if (REVIEW_MODE === "invalid") {
-        console.log("Invalid bot-review command format detected");
-        await octokit.issues.createComment({
-          owner: prDetails.owner,
-          repo: prDetails.repo,
-          issue_number: prDetails.pull_number,
-          body: `❌ Invalid command format. Valid formats are:
+const INVALID_COMMAND_HELP = `❌ Invalid command format. Valid formats are:
 - \`/bot-review\` - Review latest changes
 - \`/bot-review: <commit-sha>\` - Review a single commit
-- \`/bot-review: <base>..<head>\` - Review a commit range`
-        });
-        return;
-      }
-      
-      // Get diff based on the comment content
-      if (REVIEW_MODE === "single_commit" && COMMIT_SHA) {
-        // Get the diff of a single commit
-        console.log(`Reviewing single commit: ${COMMIT_SHA}`);
-        try {
-          const response = await octokit.repos.getCommit({
-            owner: prDetails.owner,
-            repo: prDetails.repo,
-            ref: COMMIT_SHA,
-            mediaType: { format: "diff" }
-          });
-          // @ts-expect-error - response.data is a string
-          diff = response.data;
-        } catch (error) {
-          handleGitHubPermissionError(error, prDetails, isCommentTrigger);
-          throw error;
-        }
-      } else if (REVIEW_MODE === "commit_range" && BASE_SHA) {
-        // Process commit range
-        console.log("Processing commit range mode");
-        
-        // Get base and head SHAs
-        let baseSha = BASE_SHA;
-        let headSha = HEAD_SHA;
-        
-        // Check if BASE_SHA contains full range format (like "sha1..sha2")
-        if (BASE_SHA.includes('..')) {
-          const parts = BASE_SHA.split('..');
-          baseSha = parts[0];
-          headSha = parts.length > 1 ? parts[1] : HEAD_SHA;
-          console.log(`BASE_SHA contains '..' pattern, extracted baseSha=${baseSha}, headSha=${headSha}`);
-        } else {
-          console.log(`Using separate BASE_SHA and HEAD_SHA values: base=${baseSha}, head=${headSha}`);
-        }
-        
-        // Trim any whitespace that might have been included in the SHAs
-        baseSha = baseSha.trim();
-        headSha = headSha.trim();
-        
-        if (!baseSha || !headSha) {
-          throw new Error(`Invalid commit range: ${baseSha}..${headSha}`);
-        }
-        
-        console.log(`Comparing commit range: ${baseSha} → ${headSha}`);
-        
-        try {
-          console.log(`Calling GitHub API to compare commits - owner: ${prDetails.owner}, repo: ${prDetails.repo}`);
-          const response = await octokit.repos.compareCommits({
-            owner: prDetails.owner,
-            repo: prDetails.repo,
-            base: baseSha,
-            head: headSha,
-            headers: {
-              accept: "application/vnd.github.v3.diff",
-            }
-          });
-          
-          if (!response.data) {
-            throw new Error("Empty response from GitHub API");
-          }
-          
-          diff = typeof response.data === 'string' ? response.data : String(response.data);
-          console.log("Diff length:", diff.length);
-          console.log("Diff preview (first 200 chars):", diff.substring(0, 200));
-          console.log("Number of files changed in diff:", (diff.match(/^diff --git/gm) || []).length);
-          
-          // Debug - log the file paths in the diff
-          const fileMatches = diff.match(/^diff --git a\/(.*?) b\/(.*?)$/gm);
-          if (fileMatches) {
-            console.log("Files in diff:", fileMatches.map(m => m.replace(/^diff --git a\/.*? b\//, '')).slice(0, 10).join(', ') + 
-              (fileMatches.length > 10 ? ` and ${fileMatches.length - 10} more...` : ''));
-          }
-        } catch (apiError) {
-          handleGitHubPermissionError(apiError, prDetails, isCommentTrigger);
-          console.error("Error calling GitHub API:", apiError);
-          throw new Error(`Failed to get diff from GitHub API: ${apiError instanceof Error ? apiError.message : String(apiError)}`);
-        }
-      } else {
-        // Get the diff of the latest PR changes
-        console.log("Reviewing latest PR changes");
-        try {
-          diff = await getDiff(
-            prDetails.owner,
-            prDetails.repo,
-            prDetails.pull_number
-          );
-          
-          if (!diff) {
-            throw new Error("No diff returned from GitHub API");
-          }
-        } catch (diffError) {
-          handleGitHubPermissionError(diffError, prDetails, isCommentTrigger);
-          console.error("Error getting PR diff:", diffError);
-          throw diffError;
-        }
-      }
-    } else if (eventData.action === "opened") {
-      try {
-        diff = await getDiff(
-          prDetails.owner,
-          prDetails.repo,
-          prDetails.pull_number
-        );
-      } catch (error) {
-        handleGitHubPermissionError(error, prDetails, isCommentTrigger);
-        throw error;
-      }
-    } else if (eventData.action === "synchronize") {
-      const newBaseSha = eventData.before;
-      const newHeadSha = eventData.after;
-      try {
-        const response = await octokit.repos.compareCommits({
-          headers: {
-            accept: "application/vnd.github.v3.diff",
-          },
-          owner: prDetails.owner,
-          repo: prDetails.repo,
-          base: newBaseSha,
-          head: newHeadSha,
-        });
-        diff = String(response.data);
-      } catch (error) {
-        handleGitHubPermissionError(error, prDetails, isCommentTrigger);
-        throw error;
-      }
-    } else {
-      console.log("Unsupported event:", process.env.GITHUB_EVENT_NAME);
-      return;
-    }
+- \`/bot-review: <base>..<head>\` - Review a commit range`;
 
-    if (!diff || typeof diff !== 'string' || diff.trim() === '') {
-      console.error("Empty or invalid diff returned from GitHub API");
-      throw new Error("Failed to retrieve diff from GitHub API");
-    }
+async function run(): Promise<void> {
+  const cfg = loadConfig();
+  const keyError = validateApiKeys(cfg);
+  if (keyError) {
+    core.setFailed(keyError);
+    return;
+  }
 
-    const parsedDiff = parseDiff(diff);
+  const octokit = new Octokit({ auth: cfg.githubToken });
+  const eventData = readEventData();
+  const pr = await getPRDetails(octokit, eventData);
+  const commentTrigger = isCommentTrigger();
 
-    if (!parsedDiff || parsedDiff.length === 0) {
-      console.error("Failed to parse diff:", diff);
-      throw new Error("Failed to parse diff from GitHub API");
-    }
+  if (commentTrigger && cfg.reviewMode === "invalid") {
+    await postIssueComment(octokit, pr, INVALID_COMMAND_HELP);
+    return;
+  }
 
-    const excludePatterns = core
-      .getInput("exclude")
-      .split(",")
-      .map((s) => s.trim());
-
-    const filteredDiff = parsedDiff.filter((file) => {
-      return !excludePatterns.some((pattern) =>
-        minimatch(file.to ?? "", pattern)
-      );
-    });
-
-    if (filteredDiff.length === 0) {
-      console.log("No files to review after filtering");
-      if (isCommentTrigger) {
-        await octokit.issues.createComment({
-          owner: prDetails.owner,
-          repo: prDetails.repo,
-          issue_number: prDetails.pull_number,
-          body: `✅ AI review completed, no files to review after filtering.`
-        });
-      }
-      return;
-    }
-
-    // Track if we had critical errors that should fail the action
-    let hadCriticalErrors = false;
-    
-    try {
-      const comments = await analyzeCode(filteredDiff, prDetails);
-
-      if (comments.length > 0) {
-        try {
-          await createReviewComment(
-            prDetails.owner,
-            prDetails.repo,
-            prDetails.pull_number,
-            comments
-          );
-          
-          // If the comment is triggered, reply a comment to indicate the completion
-          if (isCommentTrigger) {
-            await octokit.issues.createComment({
-              owner: prDetails.owner,
-              repo: prDetails.repo,
-              issue_number: prDetails.pull_number,
-              body: `✅ AI review completed, ${comments.length} comments generated.`
-            });
-          }
-        } catch (reviewError) {
-          hadCriticalErrors = true;
-          console.error("Error creating review comments:", reviewError);
-          
-          // If this is a permissions issue, we have already tried the fallback in createReviewComment
-          if (!(reviewError instanceof Error && reviewError.message.includes("Resource not accessible by integration"))) {
-            throw reviewError;
-          }
-        }
-      } else {
-        // If the comment is triggered but no comments are generated, also reply a message
-        if (isCommentTrigger) {
-          await octokit.issues.createComment({
-            owner: prDetails.owner,
-            repo: prDetails.repo,
-            issue_number: prDetails.pull_number,
-            body: `✅ AI review completed, no issues found.`
-          });
-        }
-      }
-    } catch (analyzeError) {
-      hadCriticalErrors = true;
-      if (analyzeError instanceof Error) {
-        core.setFailed(`Critical error during analysis: ${analyzeError.message}`);
-        
-        // If the comment is triggered, reply the error information
-        if (isCommentTrigger) {
-          await octokit.issues.createComment({
-            owner: prDetails.owner,
-            repo: prDetails.repo,
-            issue_number: prDetails.pull_number,
-            body: `❌ AI review failed: ${analyzeError.message}`
-          });
-        }
-      } else {
-        core.setFailed(`Unknown critical error during analysis: ${analyzeError}`);
-        
-        // If the comment is triggered, reply the error information
-        if (isCommentTrigger) {
-          await octokit.issues.createComment({
-            owner: prDetails.owner,
-            repo: prDetails.repo,
-            issue_number: prDetails.pull_number,
-            body: `❌ AI review failed: Unknown error`
-          });
-        }
-      }
-    }
-    
-    // Only report success if we didn't have critical errors
-    if (!hadCriticalErrors) {
-      core.info("AI Review completed successfully");
-    }
-    
+  let diff: string | null;
+  try {
+    diff = await getDiff(octokit, cfg, pr, eventData);
   } catch (error) {
-    // Log the error details
-    if (error instanceof Error) {
-      core.setFailed(`Error in AI Review: ${error.message}`);
-      console.error("Error details:", error.stack);
-    } else {
-      core.setFailed(`Unknown error in AI Review: ${error}`);
-      console.error("Unknown error:", error);
+    if (isPermissionError(error) && commentTrigger) {
+      await postIssueComment(
+        octokit,
+        pr,
+        "❌ Review failed: Insufficient permissions to access repository data. Please check the GitHub token permissions."
+      );
     }
-    
-    // Ensure the process exits with a non-zero status code
-    process.exit(1);
+    throw error;
+  }
+
+  if (diff === null) return; // unsupported event, already logged
+  if (diff.trim() === "")
+    throw new Error("Failed to retrieve diff from GitHub API");
+
+  const parsedDiff = parseDiff(diff);
+  if (!parsedDiff || parsedDiff.length === 0) {
+    throw new Error("Failed to parse diff from GitHub API");
+  }
+
+  const files = parsedDiff.filter(
+    (file) =>
+      file.to &&
+      file.to !== "/dev/null" &&
+      !cfg.exclude.some((pattern) => minimatch(file.to ?? "", pattern))
+  );
+
+  if (files.length === 0) {
+    console.log("No files to review after filtering");
+    if (commentTrigger) {
+      await upsertSummaryComment(
+        octokit,
+        pr,
+        "## AI Doc Review\n\n✅ Review completed, no files to review after filtering."
+      );
+    }
+    return;
+  }
+
+  console.log(`Reviewing ${files.length} file(s)`);
+  const styleGuideSection = loadStyleGuide(cfg);
+  const failures: string[] = [];
+
+  // Fetch full documents first (also used for verify excerpts later).
+  const fullContents = new Map<string, string | null>();
+  await mapPool(files, cfg.concurrency, async (file) => {
+    fullContents.set(
+      file.to ?? "",
+      await fetchFullContent(octokit, cfg, pr, file)
+    );
+  });
+
+  // --- Deterministic checks (no LLM): run in parallel with the LLM stages
+  const checksPromise = runChecks(
+    files.map((file): CheckFile => {
+      const p = file.to ?? "";
+      return {
+        path: p,
+        file,
+        fullContent: fullContents.get(p) ?? null,
+        isNew: file.from === "/dev/null" || file.new === true,
+      };
+    }),
+    buildCheckDeps(octokit, cfg, pr)
+  );
+
+  // --- Digest stage: PR-wide intent + structured claims ------------------
+  let digestText = "";
+  let digestSummary = "";
+  let digestClaims: import("./llm/schemas").Digest | null = null;
+  try {
+    digestClaims = await runDigest(cfg, files, pr);
+    digestText = digestToText(digestClaims);
+    digestSummary = digestText;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`Digest stage failed (continuing without it): ${message}`);
+    failures.push(`digest stage: ${message}`);
+  }
+
+  // --- Review stage: one call per file, full document + digest as context
+  const perFile = await mapPool(files, cfg.concurrency, async (file) => {
+    const path = file.to ?? "";
+    try {
+      const findings = await reviewFile(cfg, pr, file, {
+        fullContent: fullContents.get(path) ?? null,
+        digestText,
+        styleGuideSection,
+        language: detectLanguage(
+          path,
+          fullContents.get(path) ?? null,
+          cfg.docLanguage || undefined
+        ),
+      });
+      return { findings, failure: null as string | null };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`Review failed for ${path}: ${message}`);
+      return { findings: [] as Finding[], failure: `\`${path}\`: ${message}` };
+    }
+  });
+
+  let findings = perFile.flatMap((r) => r.findings);
+  const fileFailures = perFile.filter((r) => r.failure !== null).length;
+  failures.push(...perFile.flatMap((r) => (r.failure ? [r.failure] : [])));
+
+  // --- Cross-check stage: contradictions between files -------------------
+  if (digestClaims) {
+    try {
+      const crossFindings = await runCrosscheck(cfg, digestClaims);
+      if (crossFindings.length > 0) {
+        console.log(
+          `Cross-check found ${crossFindings.length} inconsistency(ies)`
+        );
+        findings = findings.concat(crossFindings);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`Cross-check stage failed (continuing): ${message}`);
+      failures.push(`cross-check stage: ${message}`);
+    }
+  }
+
+  // --- Verify stage: fact-check candidates before posting ----------------
+  const droppedByVerify: Array<{ finding: Finding; reason: string }> = [];
+  if (findings.length > 0) {
+    try {
+      const getExcerpt = buildExcerptProvider(files, fullContents);
+      const outcome = await runVerify(cfg, findings, getExcerpt);
+      findings = outcome.kept;
+      droppedByVerify.push(...outcome.dropped);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(
+        `Verify stage failed, posting findings unverified: ${message}`
+      );
+      failures.push(`verify stage (findings posted unverified): ${message}`);
+    }
+  }
+
+  // --- Deterministic check results (skip verify; still validated/deduped)
+  const checkResults = await checksPromise;
+  if (checkResults.findings.length > 0) {
+    console.log(
+      `Deterministic checks produced ${checkResults.findings.length} finding(s)`
+    );
+    findings = findings.concat(checkResults.findings);
+  }
+  failures.push(...checkResults.failures);
+
+  // --- Posting stage: validate, dedupe, post, report ---------------------
+  // Order matters: remap line numbers first, then dedupe against the
+  // comments already on the PR using the final (remapped) line numbers.
+  const batchDeduped = dedupeWithinBatch(findings);
+  const validated = validateFindings(
+    batchDeduped.unique,
+    buildCommentableLines(files)
+  );
+  const rerunDeduped = dedupeAgainstExisting(
+    validated.kept,
+    await listReviewComments(octokit, pr)
+  );
+
+  const survivingKeys = new Set(
+    rerunDeduped.unique.map((f) => `${f.path}:${f.line}`)
+  );
+  const finalComments = validated.comments.filter((c) =>
+    survivingKeys.has(`${c.path}:${c.line}`)
+  );
+  const finalKept = rerunDeduped.unique;
+  const degraded = validated.degraded;
+  const droppedCount =
+    batchDeduped.dropped.length + rerunDeduped.dropped.length;
+
+  if (finalComments.length > 0) {
+    await postReview(octokit, pr, finalComments);
+  }
+
+  await upsertSummaryComment(
+    octokit,
+    pr,
+    buildSummary({
+      digestSummary,
+      filesReviewed: files.length - fileFailures,
+      filesTotal: files.length,
+      posted: finalKept,
+      degraded,
+      droppedCount: droppedCount + droppedByVerify.length,
+      verifyDropped: droppedByVerify,
+      failures,
+    })
+  );
+
+  console.log(
+    `Done: ${finalKept.length} comment(s) posted, ${
+      degraded.length
+    } degraded, ${droppedCount + droppedByVerify.length} dropped, ${
+      failures.length
+    } failure(s)`
+  );
+}
+
+/** Fetch the full file at the PR head; null when too large or unavailable. */
+async function fetchFullContent(
+  octokit: Octokit,
+  cfg: Config,
+  pr: PRDetails,
+  file: File
+): Promise<string | null> {
+  const path = file.to;
+  if (!path) return null;
+  try {
+    const content = await getFileContent(octokit, pr, path, pr.headSha);
+    if (content && content.length / 1024 > cfg.maxFileKb) {
+      console.log(
+        `${path} is ${(content.length / 1024).toFixed(0)}KB (> ${
+          cfg.maxFileKb
+        }KB), reviewing diff hunks only`
+      );
+      return null;
+    }
+    return content;
+  } catch (error) {
+    console.log(
+      `Could not fetch full content for ${path} (${
+        error instanceof Error ? error.message : String(error)
+      }); reviewing diff hunks only`
+    );
+    return null;
   }
 }
 
-// Helper function to handle GitHub permission errors
-function handleGitHubPermissionError(error: unknown, prDetails: PRDetails, isCommentTrigger: boolean): boolean {
-  if (error instanceof Error && error.message.includes("Resource not accessible by integration")) {
-    console.log("GitHub permission error detected. Checking if we can notify the user...");
-    
-    if (isCommentTrigger) {
-      try {
-        octokit.issues.createComment({
-          owner: prDetails.owner,
-          repo: prDetails.repo,
-          issue_number: prDetails.pull_number,
-          body: `❌ Review failed: Insufficient permissions to access repository data. Please check the GitHub token permissions and make sure it has access to the repository contents and pull requests.`
-        }).catch(commentError => {
-          console.error("Also failed to post error comment:", commentError);
-        });
-      } catch (commentError) {
-        console.error("Failed to post permission error comment:", commentError);
+/** Load and parse the glossary file for the terms check. */
+function loadGlossary(cfg: Config): TermRule[] {
+  if (!cfg.glossaryPath) return [];
+  const p = path.isAbsolute(cfg.glossaryPath)
+    ? cfg.glossaryPath
+    : path.resolve(process.cwd(), cfg.glossaryPath);
+  try {
+    const rules = parseGlossary(readFileSync(p, "utf8"));
+    console.log(`Loaded ${rules.length} terminology rule(s) from ${p}`);
+    return rules;
+  } catch {
+    core.warning(`Glossary file not found at: ${p}. Terms check disabled.`);
+    return [];
+  }
+}
+
+/** Wire the side-effecting operations the deterministic checks need. */
+function buildCheckDeps(
+  octokit: Octokit,
+  cfg: Config,
+  pr: PRDetails
+): import("./checks").CheckDeps {
+  const contentCache = new Map<string, Promise<string | null>>();
+  const readFileAtHead = (p: string): Promise<string | null> => {
+    if (!contentCache.has(p)) {
+      contentCache.set(
+        p,
+        getFileContent(octokit, pr, p, pr.headSha).catch((error) => {
+          console.log(
+            `Could not read ${p} at head: ${
+              error instanceof Error ? error.message : String(error)
+            }`
+          );
+          return null;
+        })
+      );
+    }
+    return contentCache.get(p)!;
+  };
+
+  return {
+    fileExistsAtHead: async (p) => (await readFileAtHead(p)) !== null,
+    readFileAtHead,
+    searchRepo: async (query) => {
+      const result = await octokit.search.code({
+        q: `${query} repo:${pr.owner}/${pr.repo}`,
+        per_page: 20,
+      });
+      return result.data.items.map((item) => item.path);
+    },
+    searchCode: async (query) => {
+      const result = await octokit.search.code({ q: query, per_page: 1 });
+      return result.data.total_count;
+    },
+    glossary: loadGlossary(cfg),
+    tocPath: cfg.tocPath,
+    codeRepo: cfg.codeRepo,
+    docLanguage: cfg.docLanguage,
+    enabled: cfg.checks,
+  };
+}
+
+/**
+ * Excerpt provider for the verify stage: prefer the full document (±2 lines
+ * around the finding), fall back to the lines visible in the diff.
+ */
+function buildExcerptProvider(
+  files: File[],
+  fullContents: Map<string, string | null>
+): (path: string, line: number) => string {
+  const diffLines = new Map<string, Map<number, string>>();
+  for (const file of files) {
+    if (!file.to) continue;
+    const byLine = diffLines.get(file.to) ?? new Map<number, string>();
+    for (const chunk of file.chunks) {
+      for (const change of chunk.changes) {
+        if (change.type === "add")
+          byLine.set(change.ln, change.content.slice(1));
+        else if (change.type === "normal")
+          byLine.set(change.ln2, change.content.slice(1));
       }
     }
-    
-    return true;
+    diffLines.set(file.to, byLine);
   }
-  return false;
+
+  const fullLines = new Map<string, string[]>();
+  for (const [path, content] of fullContents) {
+    if (content) fullLines.set(path, content.split("\n"));
+  }
+
+  return (path, line) => {
+    const full = fullLines.get(path);
+    if (full) {
+      const start = Math.max(1, line - 2);
+      const end = Math.min(full.length, line + 2);
+      const rows: string[] = [];
+      for (let n = start; n <= end; n++) rows.push(`${n}: ${full[n - 1]}`);
+      return rows.join("\n");
+    }
+    const byLine = diffLines.get(path);
+    if (!byLine) return "";
+    const rows: string[] = [];
+    for (let n = line - 2; n <= line + 2; n++) {
+      const text = byLine.get(n);
+      if (text !== undefined) rows.push(`${n}: ${text}`);
+    }
+    return rows.join("\n");
+  };
 }
 
-main().catch((error) => {
-  console.error("Error:", error);
-  core.setFailed(`Unhandled error in AI Review: ${error}`);
-  process.exit(1);
+interface SummaryInput {
+  digestSummary: string;
+  filesReviewed: number;
+  filesTotal: number;
+  posted: Finding[];
+  degraded: Finding[];
+  droppedCount: number;
+  verifyDropped: Array<{ finding: Finding; reason: string }>;
+  failures: string[];
+}
+
+function buildSummary(input: SummaryInput): string {
+  const lines: string[] = ["## AI Doc Review", ""];
+
+  if (input.digestSummary) {
+    lines.push("### What this PR changes", "", input.digestSummary, "");
+  }
+
+  if (
+    input.failures.length === 0 &&
+    input.posted.length === 0 &&
+    input.degraded.length === 0
+  ) {
+    lines.push("✅ Review completed, no issues found.");
+  } else {
+    lines.push(
+      `Reviewed ${input.filesReviewed}/${input.filesTotal} file(s): ` +
+        `**${input.posted.length}** inline comment(s) posted` +
+        (input.droppedCount > 0
+          ? `, ${input.droppedCount} filtered or duplicate`
+          : "") +
+        (input.failures.length > 0
+          ? `, **${input.failures.length} failure(s)**`
+          : "") +
+        "."
+    );
+  }
+
+  if (input.degraded.length > 0) {
+    lines.push("", "### Findings that could not be anchored to the diff", "");
+    for (const f of input.degraded) {
+      lines.push(`- \`${f.path}\` (line ~${f.line}): ${formatBody(f)}`);
+    }
+  }
+
+  if (input.failures.length > 0) {
+    lines.push("", "### ❌ Failures", "");
+    for (const f of input.failures) lines.push(`- ${f}`);
+  }
+
+  return lines.join("\n");
+}
+
+run().catch(async (error) => {
+  const message = error instanceof Error ? error.message : String(error);
+  core.setFailed(`Error in AI Review: ${message}`);
+  console.error("Error details:", error);
+
+  // Best-effort error feedback on the PR for comment-triggered runs.
+  try {
+    if (isCommentTrigger()) {
+      const cfg = loadConfig();
+      const octokit = new Octokit({ auth: cfg.githubToken });
+      const pr = await getPRDetails(octokit, readEventData());
+      await postIssueComment(octokit, pr, `❌ AI review failed: ${message}`);
+    }
+  } catch (nested) {
+    console.error("Failed to post error comment:", nested);
+  }
 });

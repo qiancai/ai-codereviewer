@@ -1,6 +1,1742 @@
 require('./sourcemap-register.js');/******/ (() => { // webpackBootstrap
 /******/ 	var __webpack_modules__ = ({
 
+/***/ 2210:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.checkAnchorBreakage = void 0;
+const context_1 = __nccwpck_require__(3842);
+const types_1 = __nccwpck_require__(6199);
+/**
+ * Anchor breakage check — the classic docs-PR landmine: renaming a heading
+ * breaks `#old-anchor` links in OTHER files, invisible in the diff.
+ *
+ * For each heading removed from a changed file, search the repo for
+ * references to the old anchor and report every referencing location.
+ * Those files are usually not in the diff, so these findings degrade to
+ * the run summary (line validation handles that).
+ */
+const MAX_REMOVED_HEADINGS = 20;
+const MAX_REFERENCES_PER_ANCHOR = 5;
+async function checkAnchorBreakage(checkFile, deps) {
+    const removed = (0, types_1.removedHeadings)(checkFile.file).slice(0, MAX_REMOVED_HEADINGS);
+    if (removed.length === 0)
+        return [];
+    const findings = [];
+    for (const heading of removed) {
+        const anchor = (0, context_1.anchorize)(heading);
+        if (!anchor)
+            continue;
+        // References look like `file.md#anchor` or `(#anchor` in other files.
+        let referrers = [];
+        try {
+            referrers = await deps.searchRepo(`#${anchor}`);
+        }
+        catch (error) {
+            console.log(`Repo search failed for anchor "${anchor}" (${error instanceof Error ? error.message : String(error)}); skipping`);
+            continue;
+        }
+        for (const refPath of referrers
+            .filter((p) => p !== checkFile.path)
+            .slice(0, MAX_REFERENCES_PER_ANCHOR)) {
+            const line = await locateReference(deps, refPath, anchor);
+            findings.push({
+                path: refPath,
+                line: line !== null && line !== void 0 ? line : 1,
+                severity: "high",
+                category: "accuracy",
+                comment: `This file links to \`${checkFile.path}#${anchor}\`, but the heading "${heading}" ` +
+                    `is removed or renamed in this PR. The anchor link will break.`,
+                source: "check",
+            });
+        }
+    }
+    return findings;
+}
+exports.checkAnchorBreakage = checkAnchorBreakage;
+/** Find the first line in `refPath` that references `#anchor`. */
+async function locateReference(deps, refPath, anchor) {
+    const content = await deps.readFileAtHead(refPath);
+    if (!content)
+        return null;
+    const needle = `#${anchor}`;
+    const lines = content.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+        if (lines[i].includes(needle))
+            return i + 1;
+    }
+    return null;
+}
+
+
+/***/ }),
+
+/***/ 2112:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.checkCodeAnchors = exports.extractFlags = exports.shellFenceLines = void 0;
+const types_1 = __nccwpck_require__(6199);
+/**
+ * Lightweight code-anchoring check (Swimm's idea, minimal version).
+ *
+ * CLI flags in docs rot silently when the product renames them. This check
+ * extracts `--flags` from shell code blocks added by the PR and verifies
+ * each one against a configured source repository via GitHub code search.
+ *
+ * Deliberately hedged: a flag that is not found produces a "please verify"
+ * note, not an assertion — flags can be defined dynamically or generated,
+ * and code search has blind spots. Ground-truth for humans, not a gate.
+ */
+const SHELL_LANGS = new Set([
+    "bash",
+    "sh",
+    "shell",
+    "console",
+    "zsh",
+    "shell-session",
+]);
+const MAX_FLAGS_PER_RUN = 15;
+/** Line numbers that are inside shell-tagged fenced code blocks (1-based). */
+function shellFenceLines(content) {
+    const result = new Set();
+    let inFence = false;
+    let isShell = false;
+    const lines = content.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+        const m = lines[i].match(/^\s*```(\S*)/);
+        if (m) {
+            if (!inFence) {
+                inFence = true;
+                isShell = SHELL_LANGS.has(m[1].toLowerCase());
+            }
+            else {
+                inFence = false;
+                isShell = false;
+            }
+            continue;
+        }
+        if (inFence && isShell)
+            result.add(i + 1);
+    }
+    return result;
+}
+exports.shellFenceLines = shellFenceLines;
+/** Extract `--long-flags` from a line of shell text. */
+function extractFlags(text) {
+    const flags = new Set();
+    for (const m of text.matchAll(/(?:^|\s)(--[a-z][a-z0-9-]*)/g)) {
+        flags.add(m[1]);
+    }
+    return [...flags];
+}
+exports.extractFlags = extractFlags;
+async function checkCodeAnchors(checkFile, deps) {
+    if (!deps.codeRepo || !checkFile.fullContent)
+        return [];
+    const shellLines = shellFenceLines(checkFile.fullContent);
+    if (shellLines.size === 0)
+        return [];
+    // First occurrence line of each flag, added lines only, shell fences only.
+    const flagLines = new Map();
+    for (const { line, text } of (0, types_1.addedLines)(checkFile.file)) {
+        if (!shellLines.has(line))
+            continue;
+        for (const flag of extractFlags(text)) {
+            if (!flagLines.has(flag))
+                flagLines.set(flag, line);
+        }
+    }
+    if (flagLines.size === 0)
+        return [];
+    const findings = [];
+    let queried = 0;
+    for (const [flag, line] of flagLines) {
+        if (queried >= MAX_FLAGS_PER_RUN)
+            break;
+        queried++;
+        let count;
+        try {
+            count = await deps.searchCode(`"${flag}" repo:${deps.codeRepo}`);
+        }
+        catch (error) {
+            console.log(`Code search failed for "${flag}" (${error instanceof Error ? error.message : String(error)}); skipping`);
+            continue;
+        }
+        if (count === 0) {
+            findings.push({
+                path: checkFile.path,
+                line,
+                severity: "low",
+                category: "accuracy",
+                comment: `Flag \`${flag}\` was not found in [${deps.codeRepo}](https://github.com/${deps.codeRepo}) ` +
+                    `via code search. Please verify it still exists in the CLI — it may have been renamed, ` +
+                    `or it may be defined dynamically (auto-check, not an assertion).`,
+                source: "check",
+            });
+        }
+    }
+    return findings;
+}
+exports.checkCodeAnchors = checkCodeAnchors;
+
+
+/***/ }),
+
+/***/ 4799:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.runChecks = exports.parseGlossary = void 0;
+const prompts_1 = __nccwpck_require__(4272);
+const anchors_1 = __nccwpck_require__(2210);
+const code_1 = __nccwpck_require__(2112);
+const links_1 = __nccwpck_require__(904);
+const terms_1 = __nccwpck_require__(3253);
+const toc_1 = __nccwpck_require__(1007);
+const typography_1 = __nccwpck_require__(4321);
+var terms_2 = __nccwpck_require__(3253);
+Object.defineProperty(exports, "parseGlossary", ({ enumerable: true, get: function () { return terms_2.parseGlossary; } }));
+/**
+ * Run the enabled deterministic checks over the changed files.
+ * Deterministic findings skip the LLM verify stage but still go through
+ * line validation and dedupe like everything else. Individual check
+ * failures degrade to a log line — never fatal.
+ */
+async function runChecks(files, deps) {
+    const findings = [];
+    const failures = [];
+    const enabled = new Set(deps.enabled);
+    for (const checkFile of files) {
+        if (enabled.has("terms") && deps.glossary.length > 0) {
+            try {
+                findings.push(...(0, terms_1.checkTerms)(checkFile, deps.glossary));
+            }
+            catch (error) {
+                failures.push(`terms check on \`${checkFile.path}\`: ${msg(error)}`);
+            }
+        }
+        if (enabled.has("links") || enabled.has("images")) {
+            try {
+                findings.push(...(await (0, links_1.checkLinksAndImages)(checkFile, deps, {
+                    links: enabled.has("links"),
+                    images: enabled.has("images"),
+                })));
+            }
+            catch (error) {
+                failures.push(`links/images check on \`${checkFile.path}\`: ${msg(error)}`);
+            }
+        }
+        if (enabled.has("anchors")) {
+            try {
+                findings.push(...(await (0, anchors_1.checkAnchorBreakage)(checkFile, deps)));
+            }
+            catch (error) {
+                failures.push(`anchors check on \`${checkFile.path}\`: ${msg(error)}`);
+            }
+        }
+        if (enabled.has("toc")) {
+            try {
+                findings.push(...(await (0, toc_1.checkToc)(checkFile, { ...deps, tocPath: deps.tocPath })));
+            }
+            catch (error) {
+                failures.push(`toc check on \`${checkFile.path}\`: ${msg(error)}`);
+            }
+        }
+        // Typography checks are per-language (zh, fr, es, ...). The legacy
+        // check name "zh" still enables the dispatcher for compatibility.
+        if (enabled.has("typography") || enabled.has("zh")) {
+            const language = (0, prompts_1.detectLanguage)(checkFile.path, checkFile.fullContent, deps.docLanguage);
+            if (language !== "en") {
+                try {
+                    findings.push(...(0, typography_1.checkTypography)(checkFile, language));
+                }
+                catch (error) {
+                    failures.push(`typography check on \`${checkFile.path}\`: ${msg(error)}`);
+                }
+            }
+        }
+        if (enabled.has("code") && deps.codeRepo) {
+            try {
+                findings.push(...(await (0, code_1.checkCodeAnchors)(checkFile, deps)));
+            }
+            catch (error) {
+                failures.push(`code check on \`${checkFile.path}\`: ${msg(error)}`);
+            }
+        }
+    }
+    return { findings, failures };
+}
+exports.runChecks = runChecks;
+function msg(error) {
+    return error instanceof Error ? error.message : String(error);
+}
+
+
+/***/ }),
+
+/***/ 904:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.checkLinksAndImages = exports.resolveTarget = exports.extractLinks = void 0;
+const path_1 = __importDefault(__nccwpck_require__(1017));
+const context_1 = __nccwpck_require__(3842);
+const types_1 = __nccwpck_require__(6199);
+const LINK_RE = /(!?)\[[^\]]*\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
+const EXTERNAL_RE = /^[a-z][a-z0-9+.-]*:/i;
+function extractLinks(text, line) {
+    const refs = [];
+    for (const m of text.matchAll(LINK_RE)) {
+        const target = m[2].trim();
+        if (EXTERNAL_RE.test(target))
+            continue; // http:, mailto:, tel:, data:, ...
+        refs.push({ line, target, isImage: m[1] === "!", raw: m[0] });
+    }
+    return refs;
+}
+exports.extractLinks = extractLinks;
+function splitTarget(target) {
+    const hash = target.indexOf("#");
+    if (hash === -1)
+        return { filePart: target, anchorPart: "" };
+    return {
+        filePart: target.slice(0, hash),
+        anchorPart: decodeURIComponent(target.slice(hash + 1)),
+    };
+}
+/** Resolve a link target relative to the linking file's directory. */
+function resolveTarget(fromFile, filePart) {
+    const decoded = decodeURIComponent(filePart);
+    if (decoded.startsWith("/"))
+        return decoded.slice(1);
+    const dir = path_1.default.posix.dirname(fromFile);
+    return path_1.default.posix.normalize(path_1.default.posix.join(dir, decoded));
+}
+exports.resolveTarget = resolveTarget;
+async function checkLinksAndImages(checkFile, deps, mode) {
+    const findings = [];
+    const ownHeadings = checkFile.fullContent
+        ? new Set((0, context_1.extractHeadings)(checkFile.fullContent).map((h) => h.anchor))
+        : null;
+    const headingCache = new Map();
+    async function headingsOf(file) {
+        var _a;
+        if (file === checkFile.path && ownHeadings)
+            return ownHeadings;
+        if (!headingCache.has(file)) {
+            const content = await deps.readFileAtHead(file);
+            headingCache.set(file, content ? new Set((0, context_1.extractHeadings)(content).map((h) => h.anchor)) : null);
+        }
+        return (_a = headingCache.get(file)) !== null && _a !== void 0 ? _a : null;
+    }
+    for (const { line, text } of (0, types_1.addedLines)(checkFile.file)) {
+        for (const ref of extractLinks(text, line)) {
+            if (ref.isImage && !mode.images)
+                continue;
+            if (!ref.isImage && !mode.links)
+                continue;
+            const { filePart, anchorPart } = splitTarget(ref.target);
+            // Same-file anchor reference.
+            if (filePart === "") {
+                if (anchorPart &&
+                    ownHeadings &&
+                    !ownHeadings.has((0, context_1.anchorize)(anchorPart)) &&
+                    !ownHeadings.has(anchorPart)) {
+                    findings.push({
+                        path: checkFile.path,
+                        line,
+                        severity: "medium",
+                        category: "accuracy",
+                        comment: `Broken anchor: no heading matches \`#${anchorPart}\` in this document.`,
+                        source: "check",
+                    });
+                }
+                continue;
+            }
+            const resolved = resolveTarget(checkFile.path, filePart);
+            const exists = await deps.fileExistsAtHead(resolved);
+            if (!exists) {
+                findings.push({
+                    path: checkFile.path,
+                    line,
+                    severity: "high",
+                    category: "accuracy",
+                    comment: ref.isImage
+                        ? `Missing image: \`${resolved}\` does not exist at the PR head.`
+                        : `Broken link: \`${resolved}\` does not exist at the PR head.`,
+                    source: "check",
+                });
+                continue;
+            }
+            if (anchorPart && !ref.isImage) {
+                const anchors = await headingsOf(resolved);
+                if (anchors &&
+                    !anchors.has(anchorPart) &&
+                    !anchors.has((0, context_1.anchorize)(anchorPart))) {
+                    findings.push({
+                        path: checkFile.path,
+                        line,
+                        severity: "medium",
+                        category: "accuracy",
+                        comment: `Broken anchor: \`${resolved}\` has no heading matching \`#${anchorPart}\`.`,
+                        source: "check",
+                    });
+                }
+            }
+        }
+    }
+    return findings;
+}
+exports.checkLinksAndImages = checkLinksAndImages;
+
+
+/***/ }),
+
+/***/ 3253:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.checkTerms = exports.parseGlossary = void 0;
+const types_1 = __nccwpck_require__(6199);
+/**
+ * Terminology lint: scan added lines for banned terms from the glossary
+ * ("preferred: banned1, banned2" per line). Lines inside code fences are
+ * skipped — command output and UI strings are not prose.
+ */
+/** Parse a glossary file. Lines: `preferred: banned1, banned2`. `#` comments. */
+function parseGlossary(content) {
+    const rules = [];
+    for (const rawLine of content.split("\n")) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith("#"))
+            continue;
+        const colon = line.indexOf(":");
+        if (colon === -1)
+            continue;
+        const preferred = line.slice(0, colon).trim();
+        const banned = line
+            .slice(colon + 1)
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean);
+        if (preferred && banned.length > 0)
+            rules.push({ preferred, banned });
+    }
+    return rules;
+}
+exports.parseGlossary = parseGlossary;
+const CJK = /[぀-ヿ㐀-䶿一-鿿豈-﫿]/; // Hiragana, Katakana, CJK ext-A, CJK unified, compat ideographs
+function termRegex(term) {
+    const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    // Word boundaries only make sense for Latin terms; CJK terms match literally.
+    return CJK.test(term)
+        ? new RegExp(escaped, "g")
+        : new RegExp(`\\b${escaped}\\b`, "gi");
+}
+function checkTerms(checkFile, glossary) {
+    if (glossary.length === 0)
+        return [];
+    const findings = [];
+    const fenced = checkFile.fullContent
+        ? (0, types_1.fencedLines)(checkFile.fullContent)
+        : new Set();
+    for (const { line, text } of (0, types_1.addedLines)(checkFile.file)) {
+        if (fenced.has(line))
+            continue;
+        for (const rule of glossary) {
+            for (const banned of rule.banned) {
+                const re = termRegex(banned);
+                if (!re.test(text))
+                    continue;
+                findings.push({
+                    path: checkFile.path,
+                    line,
+                    severity: "low",
+                    category: "terminology",
+                    comment: `Terminology: use "${rule.preferred}" instead of "${banned}".`,
+                    suggestion: text.replace(termRegex(banned), rule.preferred),
+                    source: "check",
+                });
+            }
+        }
+    }
+    return findings;
+}
+exports.checkTerms = checkTerms;
+
+
+/***/ }),
+
+/***/ 1007:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.checkToc = void 0;
+const path_1 = __importDefault(__nccwpck_require__(1017));
+/**
+ * TOC check: a newly added Markdown file should be referenced by the docs
+ * navigation file (e.g. TOC.md). Unreferenced pages are unreachable.
+ */
+async function checkToc(checkFile, deps) {
+    if (!deps.tocPath || !checkFile.isNew || !checkFile.path.endsWith(".md")) {
+        return [];
+    }
+    const tocContent = await deps.readFileAtHead(deps.tocPath);
+    if (!tocContent)
+        return [];
+    const base = path_1.default.posix.basename(checkFile.path);
+    if (tocContent.includes(checkFile.path) || tocContent.includes(base)) {
+        return [];
+    }
+    return [
+        {
+            path: checkFile.path,
+            line: 1,
+            severity: "low",
+            category: "structure",
+            comment: `This new page is not referenced in \`${deps.tocPath}\`. Readers will not be able to navigate to it.`,
+            source: "check",
+        },
+    ];
+}
+exports.checkToc = checkToc;
+
+
+/***/ }),
+
+/***/ 6199:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.fencedLines = exports.removedHeadings = exports.addedLines = void 0;
+/** Added lines of a file with their new-side line numbers. */
+function addedLines(file) {
+    const out = [];
+    for (const chunk of file.chunks) {
+        for (const change of chunk.changes) {
+            if (change.type === "add") {
+                out.push({ line: change.ln, text: change.content.slice(1) });
+            }
+        }
+    }
+    return out;
+}
+exports.addedLines = addedLines;
+/** Removed heading texts of a file (from deleted diff lines). */
+function removedHeadings(file) {
+    const out = [];
+    for (const chunk of file.chunks) {
+        for (const change of chunk.changes) {
+            if (change.type === "del") {
+                const m = change.content.slice(1).match(/^#{1,6}\s+(.*?)\s*#*\s*$/);
+                if (m)
+                    out.push(m[1].trim());
+            }
+        }
+    }
+    return out;
+}
+exports.removedHeadings = removedHeadings;
+/** Line numbers that are inside fenced code blocks (1-based). */
+function fencedLines(content) {
+    const fenced = new Set();
+    let inFence = false;
+    let marker = "";
+    const lines = content.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+        const m = lines[i].match(/^\s*(`{3,}|~{3,})/);
+        if (m) {
+            if (!inFence) {
+                inFence = true;
+                marker = m[1][0];
+            }
+            else if (m[1][0] === marker) {
+                inFence = false;
+            }
+            continue;
+        }
+        if (inFence)
+            fenced.add(i + 1);
+    }
+    return fenced;
+}
+exports.fencedLines = fencedLines;
+
+
+/***/ }),
+
+/***/ 7114:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+/**
+ * Shared line-segmentation for typography checks: only prose segments are
+ * checked. Inline code, URLs, markdown link/image targets, and HTML tags
+ * are masked. For links/images the visible text stays prose.
+ */
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.segmentLine = void 0;
+function segmentLine(line) {
+    var _a;
+    const MASK_RE = /(`[^`]*`)|(!?\[[^\]]*\]\([^)]*\))|(https?:\/\/[^\s)]+)|(<[^>]+>)/g;
+    const segments = [];
+    let last = 0;
+    for (const m of line.matchAll(MASK_RE)) {
+        const index = (_a = m.index) !== null && _a !== void 0 ? _a : 0;
+        if (index > last) {
+            segments.push({ text: line.slice(last, index), prose: true });
+        }
+        if (m[2]) {
+            const bracketEnd = m[2].indexOf("](");
+            segments.push({ text: m[2].slice(0, bracketEnd + 1), prose: true });
+            segments.push({ text: m[2].slice(bracketEnd + 1), prose: false });
+        }
+        else {
+            segments.push({ text: m[0], prose: false });
+        }
+        last = index + m[0].length;
+    }
+    if (last < line.length) {
+        segments.push({ text: line.slice(last), prose: true });
+    }
+    return segments;
+}
+exports.segmentLine = segmentLine;
+
+
+/***/ }),
+
+/***/ 8442:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.checkEsTypography = void 0;
+const types_1 = __nccwpck_require__(6199);
+const common_1 = __nccwpck_require__(7114);
+/**
+ * Spanish typography rule: question and exclamation marks need their
+ * opening counterpart — "¿Cómo?", "¡Atención!". For each closing mark
+ * without a matching opening mark since the last sentence boundary, the
+ * opening mark is inserted at the sentence start.
+ */
+/** Where does the sentence start? After sentence-final punctuation plus
+ * whitespace, or at the segment start (skipping list/quote markers). */
+function sentenceStart(segment, before) {
+    const head = segment.slice(0, before);
+    const boundary = /[.!?…]\s+(?!.*[.!?…]\s)/.exec(head);
+    let start = boundary ? boundary.index + boundary[0].length : 0;
+    // Skip list markers and quote markers at the start.
+    const marker = /^(?:\s*(?:[-*+]|\d+\.)\s+|\s*>\s+)/.exec(segment.slice(start));
+    if (marker)
+        start += marker[0].length;
+    return start;
+}
+function fixProseSegment(text) {
+    var _a;
+    let fixed = text;
+    let changed = false;
+    // Work right-to-left so insertions do not shift earlier positions.
+    const marks = [];
+    for (const m of text.matchAll(/[?!]/g)) {
+        marks.push({ index: (_a = m.index) !== null && _a !== void 0 ? _a : 0, mark: m[0] });
+    }
+    for (let i = marks.length - 1; i >= 0; i--) {
+        const { index, mark } = marks[i];
+        const opening = mark === "?" ? "¿" : "¡";
+        const start = sentenceStart(text, index);
+        if (text.slice(start, index).includes(opening))
+            continue;
+        if (!/[A-Za-zÀ-ɏ]/.test(text.slice(start, index)))
+            continue; // no words before the mark
+        fixed = fixed.slice(0, start) + opening + fixed.slice(start);
+        changed = true;
+    }
+    return { fixed, changed };
+}
+function checkEsTypography(checkFile) {
+    const findings = [];
+    const fenced = checkFile.fullContent
+        ? (0, types_1.fencedLines)(checkFile.fullContent)
+        : new Set();
+    for (const { line, text } of (0, types_1.addedLines)(checkFile.file)) {
+        if (fenced.has(line))
+            continue;
+        const rebuilt = (0, common_1.segmentLine)(text)
+            .map((seg) => (seg.prose ? fixProseSegment(seg.text).fixed : seg.text))
+            .join("");
+        if (rebuilt === text)
+            continue;
+        findings.push({
+            path: checkFile.path,
+            line,
+            severity: "low",
+            category: "grammar",
+            comment: "Español: faltan los signos de apertura «¿» o «¡» en esta frase.",
+            suggestion: rebuilt,
+            source: "check",
+        });
+    }
+    return findings;
+}
+exports.checkEsTypography = checkEsTypography;
+
+
+/***/ }),
+
+/***/ 2662:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.checkFrTypography = void 0;
+const types_1 = __nccwpck_require__(6199);
+const common_1 = __nccwpck_require__(7114);
+/**
+ * French typography rule: a no-break space (U+00A0) is required before the
+ * "high" punctuation marks ; : ! ? — "Allons-y !", not "Allons-y!".
+ * Colons followed by a digit (times, ratios) are excluded.
+ */
+const LATIN = "A-Za-zÀ-ɏ0-9";
+const NBSP = " ";
+function fixProseSegment(text) {
+    const fixed = text.replace(new RegExp(`([${LATIN}»”\\]\\)])([;:!?])(?=\\s|$)`, "g"), "$1" + NBSP + "$2");
+    return { fixed, changed: fixed !== text };
+}
+function checkFrTypography(checkFile) {
+    const findings = [];
+    const fenced = checkFile.fullContent
+        ? (0, types_1.fencedLines)(checkFile.fullContent)
+        : new Set();
+    for (const { line, text } of (0, types_1.addedLines)(checkFile.file)) {
+        if (fenced.has(line))
+            continue;
+        const rebuilt = (0, common_1.segmentLine)(text)
+            .map((seg) => (seg.prose ? fixProseSegment(seg.text).fixed : seg.text))
+            .join("");
+        if (rebuilt === text)
+            continue;
+        findings.push({
+            path: checkFile.path,
+            line,
+            severity: "low",
+            category: "grammar",
+            comment: "Typographie française : une espace insécable est requise avant les ponctuations hautes « ; : ! ? ».",
+            suggestion: rebuilt,
+            source: "check",
+        });
+    }
+    return findings;
+}
+exports.checkFrTypography = checkFrTypography;
+
+
+/***/ }),
+
+/***/ 4321:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.checkTypography = void 0;
+const es_1 = __nccwpck_require__(8442);
+const fr_1 = __nccwpck_require__(2662);
+const zh_1 = __nccwpck_require__(4002);
+/**
+ * Typography dispatcher: run the rule set for the document's language.
+ * Languages without a deterministic rule set (ja, ko, ru, ...) return no
+ * findings — adding a language means adding a module here. Note that these
+ * rules are per-language by design: Chinese spacing rules, for example,
+ * are wrong for Japanese.
+ */
+function checkTypography(checkFile, language) {
+    switch (language) {
+        case "zh":
+            return (0, zh_1.checkZhTypography)(checkFile);
+        case "fr":
+            return (0, fr_1.checkFrTypography)(checkFile);
+        case "es":
+            return (0, es_1.checkEsTypography)(checkFile);
+        default:
+            return [];
+    }
+}
+exports.checkTypography = checkTypography;
+
+
+/***/ }),
+
+/***/ 4002:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.checkZhTypography = void 0;
+const types_1 = __nccwpck_require__(6199);
+const common_1 = __nccwpck_require__(7114);
+/**
+ * Chinese typography rules (the same rules autocorrect/zhlint enforce):
+ *  - Z1: a space is required between a CJK character and a Latin
+ *    letter/digit, in both directions ("使用TiDB" → "使用 TiDB");
+ *  - Z2: fullwidth punctuation is required in Chinese context
+ *    ("注意:xxx" → "注意：xxx", "功能,例如" → "功能，例如").
+ *
+ * These rules are correct for Chinese ONLY — Japanese and Korean
+ * typesetting have different conventions (in particular, no CJK-Latin
+ * spacing), which is why this check is gated on language === "zh".
+ */
+const CJK = "一-鿿豈-﫿";
+const CJK_RE = new RegExp(`[${CJK}]`);
+/** CJK plus fullwidth punctuation/forms — the "Chinese context" for Z2. */
+const CJK_CTX = `${CJK}　-〿＀-￯`;
+/** Halfwidth punctuation that must be fullwidth between CJK characters. */
+const FULLWIDTH_MAP = {
+    ",": "，",
+    ";": "；",
+    ":": "：",
+    "!": "！",
+    "?": "？",
+};
+function fixProseSegment(text) {
+    // Z1: space between CJK and Latin letters/digits (both directions).
+    const fixed = text
+        .replace(new RegExp(`([${CJK}])([A-Za-z0-9])`, "g"), "$1 $2")
+        .replace(new RegExp(`([A-Za-z0-9])([${CJK}])`, "g"), "$1 $2");
+    const spacing = fixed !== text;
+    // Z2: halfwidth parens wrapping CJK content become fullwidth first, so
+    // that a following halfwidth punct sees the fullwidth paren as context.
+    const parens = fixed.replace(new RegExp(`\\(([^()]*[${CJK}][^()]*)\\)`, "g"), "（$1）");
+    // Z2: halfwidth punctuation in Chinese context becomes fullwidth —
+    // between two CJK-context chars, or after a CJK char at the end of a
+    // prose segment / before whitespace (sentence-final).
+    const z2 = parens
+        .replace(new RegExp(`([${CJK_CTX}])([,;:!?])(?=[${CJK_CTX}])`, "g"), (_m, cjk, punct) => { var _a; return cjk + ((_a = FULLWIDTH_MAP[punct]) !== null && _a !== void 0 ? _a : punct); })
+        .replace(new RegExp(`([${CJK}])([,;:!?])(?=\\s|$)`, "g"), (_m, cjk, punct) => { var _a; return cjk + ((_a = FULLWIDTH_MAP[punct]) !== null && _a !== void 0 ? _a : punct); });
+    return { fixed: z2, spacing, punctuation: z2 !== fixed };
+}
+function checkZhTypography(checkFile) {
+    const findings = [];
+    const fenced = checkFile.fullContent
+        ? (0, types_1.fencedLines)(checkFile.fullContent)
+        : new Set();
+    for (const { line, text } of (0, types_1.addedLines)(checkFile.file)) {
+        if (fenced.has(line))
+            continue;
+        if (!CJK_RE.test(text))
+            continue;
+        let spacing = false;
+        let punctuation = false;
+        const rebuilt = (0, common_1.segmentLine)(text)
+            .map((seg) => {
+            if (!seg.prose)
+                return seg.text;
+            const fix = fixProseSegment(seg.text);
+            spacing = spacing || fix.spacing;
+            punctuation = punctuation || fix.punctuation;
+            return fix.fixed;
+        })
+            .join("");
+        if (rebuilt === text)
+            continue;
+        const issues = [];
+        if (spacing)
+            issues.push("中西文/数字之间应加空格");
+        if (punctuation)
+            issues.push("中文语境应使用全角标点");
+        findings.push({
+            path: checkFile.path,
+            line,
+            severity: "low",
+            category: "grammar",
+            comment: `中文排版：${issues.join("；")}。`,
+            suggestion: rebuilt,
+            source: "check",
+        });
+    }
+    return findings;
+}
+exports.checkZhTypography = checkZhTypography;
+
+
+/***/ }),
+
+/***/ 88:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.validateApiKeys = exports.helperModel = exports.mainModel = exports.loadConfig = void 0;
+const core = __importStar(__nccwpck_require__(2186));
+function getInt(name, fallback) {
+    const raw = core.getInput(name);
+    if (!raw)
+        return fallback;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0) {
+        core.warning(`Invalid value for ${name}: "${raw}", falling back to ${fallback}`);
+        return fallback;
+    }
+    return Math.floor(n);
+}
+function loadConfig() {
+    const provider = (core.getInput("API_PROVIDER") || "openai").toLowerCase();
+    if (provider !== "openai" && provider !== "deepseek") {
+        throw new Error(`Unsupported API_PROVIDER: ${provider}`);
+    }
+    const openaiModel = core.getInput("OPENAI_API_MODEL");
+    const deepseekModel = core.getInput("DEEPSEEK_API_MODEL");
+    const fastModel = core.getInput("FAST_MODEL");
+    return {
+        githubToken: core.getInput("GITHUB_TOKEN", { required: true }),
+        provider,
+        openaiApiKey: core.getInput("OPENAI_API_KEY"),
+        openaiModel,
+        deepseekApiKey: core.getInput("DEEPSEEK_API_KEY"),
+        deepseekModel,
+        fastModel,
+        reviewMode: core.getInput("REVIEW_MODE") || "default",
+        commitSha: core.getInput("COMMIT_SHA") || "",
+        baseSha: core.getInput("BASE_SHA") || "",
+        headSha: core.getInput("HEAD_SHA") || "",
+        promptPath: core.getInput("PROMPT_PATH") || "",
+        styleGuidePath: core.getInput("STYLE_GUIDE_PATH") || "",
+        glossaryPath: core.getInput("GLOSSARY_PATH") || "",
+        checks: (core.getInput("CHECKS") || "anchors,links,images,typography")
+            .split(",")
+            .map((s) => s.trim().toLowerCase())
+            .filter(Boolean),
+        tocPath: core.getInput("TOC_PATH") || "",
+        codeRepo: core.getInput("CODE_REPO") || "",
+        docLanguage: core.getInput("DOC_LANGUAGE") || "",
+        exclude: (core.getInput("exclude") || "")
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean),
+        maxFileKb: getInt("MAX_FILE_KB", 50),
+        maxTokens: getInt("MAX_TOKENS", 4096),
+        concurrency: getInt("CONCURRENCY", 4),
+    };
+}
+exports.loadConfig = loadConfig;
+/** The model used for the strong review stages. */
+function mainModel(cfg) {
+    return cfg.provider === "openai" ? cfg.openaiModel : cfg.deepseekModel;
+}
+exports.mainModel = mainModel;
+/** The model used for cheap helper stages (digest, verify). */
+function helperModel(cfg) {
+    return cfg.fastModel || mainModel(cfg);
+}
+exports.helperModel = helperModel;
+function validateApiKeys(cfg) {
+    if (cfg.provider === "openai" && !cfg.openaiApiKey) {
+        return "OPENAI_API_KEY is required when API_PROVIDER is set to 'openai'";
+    }
+    if (cfg.provider === "deepseek" && !cfg.deepseekApiKey) {
+        return "DEEPSEEK_API_KEY is required when API_PROVIDER is set to 'deepseek'";
+    }
+    return null;
+}
+exports.validateApiKeys = validateApiKeys;
+
+
+/***/ }),
+
+/***/ 3842:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.remapLine = exports.buildCommentableLines = exports.extractHeadings = exports.anchorize = void 0;
+/**
+ * Diff/text context utilities: which lines are commentable, and
+ * Markdown heading/anchor extraction (used by the deterministic checks).
+ */
+/**
+ * GitHub-style anchor slug for a heading: lowercase, strip everything that
+ * is not a letter/number/space/hyphen/underscore, spaces become hyphens.
+ */
+function anchorize(heading) {
+    return heading
+        .trim()
+        .toLowerCase()
+        .replace(/[^\p{L}\p{N} _-]/gu, "")
+        .replace(/ /g, "-");
+}
+exports.anchorize = anchorize;
+const ATX_HEADING = /^(#{1,6})\s+(.*?)\s*#*\s*$/;
+/** Extract ATX headings, skipping fenced code blocks. */
+function extractHeadings(content) {
+    var _a;
+    const headings = [];
+    const anchorsSeen = new Map();
+    let inFence = false;
+    let fenceMarker = "";
+    const lines = content.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const fence = line.match(/^\s*(`{3,}|~{3,})/);
+        if (fence) {
+            if (!inFence) {
+                inFence = true;
+                fenceMarker = fence[1][0];
+            }
+            else if (fence[1][0] === fenceMarker) {
+                inFence = false;
+            }
+            continue;
+        }
+        if (inFence)
+            continue;
+        const m = line.match(ATX_HEADING);
+        if (!m)
+            continue;
+        const text = m[2].trim();
+        let anchor = anchorize(text);
+        // GitHub de-duplicates repeated anchors with -1, -2, ...
+        const seen = (_a = anchorsSeen.get(anchor)) !== null && _a !== void 0 ? _a : 0;
+        anchorsSeen.set(anchor, seen + 1);
+        if (seen > 0)
+            anchor = `${anchor}-${seen}`;
+        headings.push({ depth: m[1].length, text, anchor, line: i + 1 });
+    }
+    return headings;
+}
+exports.extractHeadings = extractHeadings;
+/**
+ * Build per-file sets of commentable and added lines from the parsed diff.
+ * GitHub only accepts review comments on lines that appear in the diff.
+ */
+function buildCommentableLines(files) {
+    var _a;
+    const map = new Map();
+    for (const file of files) {
+        if (!file.to || file.to === "/dev/null")
+            continue;
+        const entry = (_a = map.get(file.to)) !== null && _a !== void 0 ? _a : {
+            commentable: new Set(),
+            added: new Set(),
+        };
+        for (const chunk of file.chunks) {
+            collectChunkLines(chunk, entry);
+        }
+        map.set(file.to, entry);
+    }
+    return map;
+}
+exports.buildCommentableLines = buildCommentableLines;
+function collectChunkLines(chunk, entry) {
+    for (const change of chunk.changes) {
+        if (change.type === "add") {
+            entry.commentable.add(change.ln);
+            entry.added.add(change.ln);
+        }
+        else if (change.type === "normal") {
+            entry.commentable.add(change.ln2);
+        }
+        // deletions have no RIGHT-side line; they cannot anchor comments
+    }
+}
+/**
+ * Map a (possibly hallucinated) line number onto the diff:
+ * exact commentable hit → itself; otherwise the nearest added line within
+ * `tolerance`; otherwise null (the finding degrades to the summary).
+ */
+function remapLine(entry, line, tolerance = 5) {
+    if (!entry)
+        return null;
+    if (entry.commentable.has(line))
+        return line;
+    for (let delta = 1; delta <= tolerance; delta++) {
+        if (entry.added.has(line + delta))
+            return line + delta;
+        if (entry.added.has(line - delta))
+            return line - delta;
+    }
+    return null;
+}
+exports.remapLine = remapLine;
+
+
+/***/ }),
+
+/***/ 5928:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.postIssueComment = exports.postReview = exports.isPermissionError = exports.upsertSummaryComment = exports.SUMMARY_MARKER = exports.listReviewComments = exports.getFileContent = exports.getDiff = exports.getPRDetails = exports.isCommentTrigger = exports.readEventData = void 0;
+const fs_1 = __nccwpck_require__(7147);
+function readEventData() {
+    const eventPath = process.env.GITHUB_EVENT_PATH || "";
+    if (!eventPath) {
+        throw new Error("GITHUB_EVENT_PATH environment variable is not set");
+    }
+    return JSON.parse((0, fs_1.readFileSync)(eventPath, "utf8"));
+}
+exports.readEventData = readEventData;
+function isCommentTrigger() {
+    return process.env.GITHUB_EVENT_NAME === "issue_comment";
+}
+exports.isCommentTrigger = isCommentTrigger;
+async function getPRDetails(octokit, eventData) {
+    var _a, _b, _c, _d, _e;
+    let owner;
+    let repo;
+    let pull_number;
+    if (process.env.GITHUB_EVENT_NAME === "issue_comment") {
+        if (!((_a = eventData.issue) === null || _a === void 0 ? void 0 : _a.pull_request)) {
+            throw new Error("Comment is not on a pull request");
+        }
+        const urlParts = eventData.issue.pull_request.url.split("/");
+        pull_number = parseInt(urlParts[urlParts.length - 1], 10);
+        repo = urlParts[urlParts.length - 3];
+        owner = urlParts[urlParts.length - 4];
+    }
+    else {
+        if (!((_b = eventData.repository) === null || _b === void 0 ? void 0 : _b.owner)) {
+            throw new Error("Invalid event data: missing repository information");
+        }
+        owner = eventData.repository.owner.login;
+        repo = eventData.repository.name;
+        pull_number = eventData.number || ((_c = eventData.pull_request) === null || _c === void 0 ? void 0 : _c.number);
+        if (!pull_number) {
+            throw new Error("Invalid event data: missing pull request number");
+        }
+    }
+    const pr = await octokit.pulls.get({ owner, repo, pull_number });
+    return {
+        owner,
+        repo,
+        pull_number,
+        title: (_d = pr.data.title) !== null && _d !== void 0 ? _d : "",
+        description: (_e = pr.data.body) !== null && _e !== void 0 ? _e : "",
+        headSha: pr.data.head.sha,
+    };
+}
+exports.getPRDetails = getPRDetails;
+async function getPRDiff(octokit, pr) {
+    const response = await octokit.pulls.get({
+        owner: pr.owner,
+        repo: pr.repo,
+        pull_number: pr.pull_number,
+        mediaType: { format: "diff" },
+    });
+    return response.data;
+}
+/** Resolve the diff according to REVIEW_MODE and the triggering event. */
+async function getDiff(octokit, cfg, pr, eventData) {
+    if (isCommentTrigger()) {
+        if (cfg.reviewMode === "invalid")
+            return null; // caller handles the reply
+        if (cfg.reviewMode === "single_commit" && cfg.commitSha) {
+            console.log(`Reviewing single commit: ${cfg.commitSha}`);
+            const response = await octokit.repos.getCommit({
+                owner: pr.owner,
+                repo: pr.repo,
+                ref: cfg.commitSha,
+                mediaType: { format: "diff" },
+            });
+            return response.data;
+        }
+        if (cfg.reviewMode === "commit_range" && cfg.baseSha) {
+            let baseSha = cfg.baseSha;
+            let headSha = cfg.headSha;
+            if (baseSha.includes("..")) {
+                const parts = baseSha.split("..");
+                baseSha = parts[0];
+                headSha = parts.length > 1 ? parts[1] : headSha;
+            }
+            baseSha = baseSha.trim();
+            headSha = headSha.trim();
+            if (!baseSha || !headSha) {
+                throw new Error(`Invalid commit range: ${baseSha}..${headSha}`);
+            }
+            console.log(`Comparing commit range: ${baseSha} → ${headSha}`);
+            const response = await octokit.repos.compareCommits({
+                owner: pr.owner,
+                repo: pr.repo,
+                base: baseSha,
+                head: headSha,
+                headers: { accept: "application/vnd.github.v3.diff" },
+            });
+            return typeof response.data === "string"
+                ? response.data
+                : String(response.data);
+        }
+        // default / "latest": the whole PR diff
+        return getPRDiff(octokit, pr);
+    }
+    if (eventData.action === "opened") {
+        return getPRDiff(octokit, pr);
+    }
+    if (eventData.action === "synchronize") {
+        const response = await octokit.repos.compareCommits({
+            owner: pr.owner,
+            repo: pr.repo,
+            base: eventData.before,
+            head: eventData.after,
+            headers: { accept: "application/vnd.github.v3.diff" },
+        });
+        return typeof response.data === "string"
+            ? response.data
+            : String(response.data);
+    }
+    console.log("Unsupported event:", process.env.GITHUB_EVENT_NAME);
+    return null;
+}
+exports.getDiff = getDiff;
+/** Fetch the full text of a file at a given ref; null when it does not exist. */
+async function getFileContent(octokit, pr, path, ref) {
+    try {
+        const response = await octokit.repos.getContent({
+            owner: pr.owner,
+            repo: pr.repo,
+            path,
+            ref,
+            mediaType: { format: "raw" },
+        });
+        return response.data;
+    }
+    catch (error) {
+        const status = error === null || error === void 0 ? void 0 : error.status;
+        if (status === 404)
+            return null;
+        throw error;
+    }
+}
+exports.getFileContent = getFileContent;
+/** All review comments on the PR (paginated), for re-run dedupe. */
+async function listReviewComments(octokit, pr) {
+    const comments = await octokit.paginate(octokit.pulls.listReviewComments, {
+        owner: pr.owner,
+        repo: pr.repo,
+        pull_number: pr.pull_number,
+        per_page: 100,
+    });
+    return comments.map((c) => {
+        var _a, _b, _c;
+        return ({
+            path: c.path,
+            line: (_a = c.line) !== null && _a !== void 0 ? _a : c.original_line,
+            body: (_b = c.body) !== null && _b !== void 0 ? _b : "",
+            isBot: ((_c = c.user) === null || _c === void 0 ? void 0 : _c.type) === "Bot",
+        });
+    });
+}
+exports.listReviewComments = listReviewComments;
+exports.SUMMARY_MARKER = "<!-- ai-doc-reviewer:summary -->";
+/** Create or update the single summary issue-comment for this action. */
+async function upsertSummaryComment(octokit, pr, body) {
+    const existing = await octokit.paginate(octokit.issues.listComments, {
+        owner: pr.owner,
+        repo: pr.repo,
+        issue_number: pr.pull_number,
+        per_page: 100,
+    });
+    const mine = existing.find((c) => { var _a, _b; return ((_a = c.user) === null || _a === void 0 ? void 0 : _a.type) === "Bot" && ((_b = c.body) !== null && _b !== void 0 ? _b : "").includes(exports.SUMMARY_MARKER); });
+    const fullBody = `${exports.SUMMARY_MARKER}\n${body}`;
+    if (mine) {
+        await octokit.issues.updateComment({
+            owner: pr.owner,
+            repo: pr.repo,
+            comment_id: mine.id,
+            body: fullBody,
+        });
+    }
+    else {
+        await octokit.issues.createComment({
+            owner: pr.owner,
+            repo: pr.repo,
+            issue_number: pr.pull_number,
+            body: fullBody,
+        });
+    }
+}
+exports.upsertSummaryComment = upsertSummaryComment;
+function isPermissionError(error) {
+    return (error instanceof Error &&
+        error.message.includes("Resource not accessible by integration"));
+}
+exports.isPermissionError = isPermissionError;
+/** Post one review with all inline comments; fall back to a plain issue comment. */
+async function postReview(octokit, pr, comments) {
+    try {
+        await octokit.pulls.createReview({
+            owner: pr.owner,
+            repo: pr.repo,
+            pull_number: pr.pull_number,
+            commit_id: pr.headSha,
+            comments,
+            event: "COMMENT",
+        });
+    }
+    catch (error) {
+        if (!isPermissionError(error))
+            throw error;
+        console.log("Permissions issue; posting findings as a regular comment instead");
+        const commentBody = `### AI Review Comments\n\n${comments
+            .map((c) => `**File:** ${c.path}, **Line:** ${c.line}\n${c.body}\n\n---\n`)
+            .join("\n")}`;
+        await octokit.issues.createComment({
+            owner: pr.owner,
+            repo: pr.repo,
+            issue_number: pr.pull_number,
+            body: commentBody,
+        });
+    }
+}
+exports.postReview = postReview;
+/** Post a plain issue comment (used for command-feedback and error reporting). */
+async function postIssueComment(octokit, pr, body) {
+    await octokit.issues.createComment({
+        owner: pr.owner,
+        repo: pr.repo,
+        issue_number: pr.pull_number,
+        body,
+    });
+}
+exports.postIssueComment = postIssueComment;
+
+
+/***/ }),
+
+/***/ 2852:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.chatJson = exports.extractJson = exports.chat = exports.LlmError = void 0;
+const openai_1 = __importDefault(__nccwpck_require__(47));
+/**
+ * Provider-agnostic LLM client.
+ *
+ * Hard guarantees (the failure modes the old implementation hid):
+ * - JSON mode is enabled explicitly for both providers; no model-name sniffing.
+ * - finish_reason === "length" triggers one retry with doubled max_tokens;
+ *   if it still truncates, an LlmError is thrown. Truncation is never
+ *   reported back as "no findings".
+ * - 429/5xx/network errors are retried with exponential backoff.
+ * - chatJson throws on unparseable/invalid output instead of returning [].
+ */
+class LlmError extends Error {
+    constructor(message, cause) {
+        super(message);
+        this.cause = cause;
+        this.name = "LlmError";
+    }
+}
+exports.LlmError = LlmError;
+const MAX_ATTEMPTS = 3;
+const BASE_DELAY_MS = 1000;
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+function isRetryable(error) {
+    const status = error === null || error === void 0 ? void 0 : error.status;
+    if (status === undefined)
+        return true; // network-level failure
+    return status === 429 || status >= 500;
+}
+/** Run fn with exponential backoff on transient failures. */
+async function withRetries(fn) {
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+        try {
+            return await fn();
+        }
+        catch (error) {
+            if (!isRetryable(error) || attempt === MAX_ATTEMPTS) {
+                throw new LlmError(`LLM request failed after ${attempt} attempt(s): ${error instanceof Error ? error.message : String(error)}`, error);
+            }
+            const delay = BASE_DELAY_MS * 2 ** (attempt - 1) + Math.random() * 500;
+            console.log(`LLM request failed (attempt ${attempt}/${MAX_ATTEMPTS}), retrying in ${Math.round(delay)}ms: ${error instanceof Error ? error.message : String(error)}`);
+            await sleep(delay);
+        }
+    }
+    throw new LlmError("unreachable");
+}
+async function callOpenAI(cfg, opts) {
+    var _a, _b, _c, _d, _e;
+    const openai = new openai_1.default({ apiKey: cfg.openaiApiKey });
+    const messages = [];
+    if (opts.system)
+        messages.push({ role: "system", content: opts.system });
+    messages.push({ role: "user", content: opts.prompt });
+    const response = await openai.chat.completions.create({
+        model: opts.model,
+        messages,
+        temperature: (_a = opts.temperature) !== null && _a !== void 0 ? _a : 0.1,
+        max_tokens: opts.maxTokens,
+        response_format: { type: "json_object" },
+    });
+    const choice = response.choices[0];
+    return {
+        content: (_d = (_c = (_b = choice === null || choice === void 0 ? void 0 : choice.message) === null || _b === void 0 ? void 0 : _b.content) === null || _c === void 0 ? void 0 : _c.trim()) !== null && _d !== void 0 ? _d : "",
+        finishReason: (_e = choice === null || choice === void 0 ? void 0 : choice.finish_reason) !== null && _e !== void 0 ? _e : "unknown",
+    };
+}
+async function callDeepseek(cfg, opts) {
+    var _a, _b, _c, _d;
+    const messages = [];
+    if (opts.system)
+        messages.push({ role: "system", content: opts.system });
+    messages.push({ role: "user", content: opts.prompt });
+    const response = await fetch("https://api.deepseek.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${cfg.deepseekApiKey}`,
+        },
+        body: JSON.stringify({
+            model: opts.model,
+            messages,
+            temperature: (_a = opts.temperature) !== null && _a !== void 0 ? _a : 0.2,
+            max_tokens: opts.maxTokens,
+            response_format: { type: "json_object" },
+        }),
+    });
+    if (!response.ok) {
+        const errorText = await response.text();
+        const err = new Error(`Deepseek API error: ${response.status} ${response.statusText} - ${errorText}`);
+        err.status = response.status;
+        throw err;
+    }
+    const data = (await response.json());
+    const choice = (_b = data.choices) === null || _b === void 0 ? void 0 : _b[0];
+    if (!((_c = choice === null || choice === void 0 ? void 0 : choice.message) === null || _c === void 0 ? void 0 : _c.content)) {
+        throw new LlmError("No content in Deepseek response");
+    }
+    return {
+        content: choice.message.content.trim(),
+        finishReason: (_d = choice.finish_reason) !== null && _d !== void 0 ? _d : "unknown",
+    };
+}
+function chatOnce(cfg, opts) {
+    return cfg.provider === "openai"
+        ? callOpenAI(cfg, opts)
+        : callDeepseek(cfg, opts);
+}
+function ensureContent(result) {
+    if (!result.content)
+        throw new LlmError("Empty content in model response");
+    return result;
+}
+/**
+ * Send a chat request with retry on transient failures and one
+ * truncation-escalation retry. Throws LlmError on unrecoverable failure.
+ */
+async function chat(cfg, opts) {
+    const first = ensureContent(await withRetries(() => chatOnce(cfg, { ...opts, maxTokens: opts.maxTokens })));
+    if (first.finishReason !== "length")
+        return first;
+    const doubled = opts.maxTokens * 2;
+    console.log(`Response truncated (finish_reason=length), retrying with max_tokens=${doubled}`);
+    const second = ensureContent(await withRetries(() => chatOnce(cfg, { ...opts, maxTokens: doubled })));
+    if (second.finishReason === "length") {
+        throw new LlmError("Response truncated even after doubling max_tokens");
+    }
+    return second;
+}
+exports.chat = chat;
+/**
+ * Extract the first JSON object from a model response, tolerating code
+ * fences and surrounding prose despite JSON mode being enabled.
+ */
+function extractJson(text) {
+    const trimmed = text.trim();
+    // Fast path: the whole response is JSON.
+    try {
+        return JSON.parse(trimmed);
+    }
+    catch {
+        // fall through to salvage
+    }
+    // Strip a single enclosing code fence if present.
+    const fence = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+    if (fence && fence[1]) {
+        try {
+            return JSON.parse(fence[1]);
+        }
+        catch {
+            // fall through
+        }
+    }
+    // Last resort: first '{' to last '}'.
+    const start = trimmed.indexOf("{");
+    const end = trimmed.lastIndexOf("}");
+    if (start !== -1 && end > start) {
+        try {
+            return JSON.parse(trimmed.slice(start, end + 1));
+        }
+        catch {
+            // give up
+        }
+    }
+    throw new LlmError("Could not extract valid JSON from model response");
+}
+exports.extractJson = extractJson;
+/**
+ * Chat + JSON extraction + schema validation.
+ * Throws LlmError when the response cannot be parsed or validated —
+ * callers must treat that as a stage failure, never as "no findings".
+ */
+async function chatJson(cfg, opts, validate) {
+    const result = await chat(cfg, opts);
+    const parsed = extractJson(result.content);
+    const validated = validate(parsed);
+    if (validated === null) {
+        throw new LlmError(`Model response did not match the expected schema (first 300 chars: ${result.content.slice(0, 300)})`);
+    }
+    return validated;
+}
+exports.chatJson = chatJson;
+
+
+/***/ }),
+
+/***/ 8285:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.validateVerdicts = exports.validateInconsistencies = exports.validateDigest = exports.validateReviews = void 0;
+/**
+ * Validators for LLM JSON outputs. All validators are total functions:
+ * they never throw on malformed input, they return `null` when the shape
+ * is unusable, and they sanitize/coerce individual items so one bad item
+ * does not sink the whole response.
+ */
+const SEVERITIES = ["high", "medium", "low"];
+const CATEGORIES = [
+    "accuracy",
+    "logic",
+    "clarity",
+    "terminology",
+    "structure",
+    "grammar",
+];
+function asRecord(u) {
+    if (u && typeof u === "object" && !Array.isArray(u)) {
+        return u;
+    }
+    return null;
+}
+function asNumber(u) {
+    if (typeof u === "number" && Number.isFinite(u))
+        return Math.floor(u);
+    if (typeof u === "string" && u.trim() !== "") {
+        const n = Number(u);
+        if (Number.isFinite(n))
+            return Math.floor(n);
+    }
+    return null;
+}
+function asNonEmptyString(u) {
+    return typeof u === "string" && u.trim() !== "" ? u : null;
+}
+function pick(u, allowed, fallback) {
+    return typeof u === "string" && allowed.includes(u)
+        ? u
+        : fallback;
+}
+/**
+ * Validate the per-file review response. Accepts both the current schema
+ * (line/end_line/severity/category/comment/suggestion) and the legacy one
+ * (lineNumber/reviewComment/suggestion) so old custom prompt templates keep
+ * working. Individual invalid items are dropped, not fatal.
+ */
+function validateReviews(u, path) {
+    var _a, _b, _c;
+    const root = asRecord(u);
+    if (!root || !Array.isArray(root.reviews))
+        return null;
+    const reviews = [];
+    for (const item of root.reviews) {
+        const rec = asRecord(item);
+        if (!rec)
+            continue;
+        const line = asNumber((_a = rec.line) !== null && _a !== void 0 ? _a : rec.lineNumber);
+        const comment = asNonEmptyString((_b = rec.comment) !== null && _b !== void 0 ? _b : rec.reviewComment);
+        if (line === null || line <= 0 || !comment)
+            continue;
+        const endLine = asNumber((_c = rec.end_line) !== null && _c !== void 0 ? _c : rec.endLine);
+        const suggestion = typeof rec.suggestion === "string" && rec.suggestion !== ""
+            ? rec.suggestion
+            : undefined;
+        reviews.push({
+            path,
+            line,
+            endLine: endLine !== null && endLine > line ? endLine : undefined,
+            severity: pick(rec.severity, SEVERITIES, "medium"),
+            category: pick(rec.category, CATEGORIES, "clarity"),
+            comment,
+            suggestion,
+            source: "llm",
+        });
+    }
+    return { reviews };
+}
+exports.validateReviews = validateReviews;
+function validateDigest(u) {
+    var _a, _b;
+    const root = asRecord(u);
+    if (!root)
+        return null;
+    const files = [];
+    if (Array.isArray(root.files)) {
+        for (const f of root.files) {
+            const rec = asRecord(f);
+            if (!rec)
+                continue;
+            const path = asNonEmptyString(rec.path);
+            const summary = asNonEmptyString(rec.summary);
+            if (path && summary)
+                files.push({ path, summary });
+        }
+    }
+    const claims = [];
+    if (Array.isArray(root.claims)) {
+        for (const c of root.claims) {
+            const rec = asRecord(c);
+            if (!rec)
+                continue;
+            const name = asNonEmptyString(rec.name);
+            const value = asNonEmptyString(rec.value);
+            const file = asNonEmptyString(rec.file);
+            if (!name || !value || !file)
+                continue;
+            claims.push({
+                type: (_a = asNonEmptyString(rec.type)) !== null && _a !== void 0 ? _a : "term",
+                name,
+                value,
+                file,
+                line: asNumber(rec.line),
+            });
+        }
+    }
+    return {
+        digest: {
+            intent: (_b = asNonEmptyString(root.intent)) !== null && _b !== void 0 ? _b : "",
+            files,
+            claims,
+        },
+    };
+}
+exports.validateDigest = validateDigest;
+/** Cross-check response: inconsistencies found by comparing claims across files. */
+function validateInconsistencies(u) {
+    const root = asRecord(u);
+    if (!root || !Array.isArray(root.inconsistencies))
+        return null;
+    const findings = [];
+    for (const item of root.inconsistencies) {
+        const rec = asRecord(item);
+        if (!rec)
+            continue;
+        const path = asNonEmptyString(rec.file);
+        const line = asNumber(rec.line);
+        const comment = asNonEmptyString(rec.comment);
+        if (!path || line === null || line <= 0 || !comment)
+            continue;
+        findings.push({
+            path,
+            line,
+            severity: pick(rec.severity, SEVERITIES, "high"),
+            category: pick(rec.category, CATEGORIES, "accuracy"),
+            comment,
+            source: "crosscheck",
+        });
+    }
+    return { findings };
+}
+exports.validateInconsistencies = validateInconsistencies;
+/** Verify-stage response: one verdict per candidate finding. */
+function validateVerdicts(u) {
+    var _a, _b;
+    const root = asRecord(u);
+    if (!root || !Array.isArray(root.verdicts))
+        return null;
+    const verdicts = [];
+    for (const item of root.verdicts) {
+        const rec = asRecord(item);
+        if (!rec)
+            continue;
+        const id = asNumber(rec.id);
+        if (id === null)
+            continue;
+        const confidence = (_a = asNumber(rec.confidence)) !== null && _a !== void 0 ? _a : 0;
+        verdicts.push({
+            id,
+            keep: rec.keep === true || rec.keep === "true" || rec.keep === "keep",
+            confidence: Math.max(0, Math.min(100, confidence)),
+            reason: (_b = asNonEmptyString(rec.reason)) !== null && _b !== void 0 ? _b : "",
+        });
+    }
+    return { verdicts };
+}
+exports.validateVerdicts = validateVerdicts;
+
+
+/***/ }),
+
 /***/ 3109:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
@@ -33,170 +1769,1018 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-const fs_1 = __nccwpck_require__(7147);
 const core = __importStar(__nccwpck_require__(2186));
-const openai_1 = __importDefault(__nccwpck_require__(47));
 const rest_1 = __nccwpck_require__(5375);
 const parse_diff_1 = __importDefault(__nccwpck_require__(4833));
 const minimatch_1 = __importDefault(__nccwpck_require__(2002));
+const fs_1 = __nccwpck_require__(7147);
 const path_1 = __importDefault(__nccwpck_require__(1017));
-const GITHUB_TOKEN = core.getInput("GITHUB_TOKEN");
-const API_PROVIDER = core.getInput("API_PROVIDER") || "openai";
-const OPENAI_API_KEY = core.getInput("OPENAI_API_KEY");
-const OPENAI_API_MODEL = core.getInput("OPENAI_API_MODEL");
-const DEEPSEEK_API_KEY = core.getInput("DEEPSEEK_API_KEY");
-const DEEPSEEK_API_MODEL = core.getInput("DEEPSEEK_API_MODEL");
-const REVIEW_MODE = core.getInput("REVIEW_MODE") || "default";
-const COMMIT_SHA = core.getInput("COMMIT_SHA") || "";
-const BASE_SHA = core.getInput("BASE_SHA") || "";
-const HEAD_SHA = core.getInput("HEAD_SHA") || "";
-const PROMPT_PATH = core.getInput("PROMPT_PATH") || "";
-// ALLOWED_USERS is no longer needed as permission checking is handled at the workflow level
-// const ALLOWED_USERS: string[] = core.getInput("ALLOWED_USERS").split(",").map(u => u.trim());
-const octokit = new rest_1.Octokit({ auth: GITHUB_TOKEN });
-// Initialize OpenAI client if using OpenAI
-const openai = API_PROVIDER === "openai"
-    ? new openai_1.default({ apiKey: OPENAI_API_KEY })
-    : null;
-async function getPRDetails() {
-    var _a, _b, _c, _d, _e;
+const config_1 = __nccwpck_require__(88);
+const context_1 = __nccwpck_require__(3842);
+const checks_1 = __nccwpck_require__(4799);
+const github_1 = __nccwpck_require__(5928);
+const prompts_1 = __nccwpck_require__(4272);
+const digest_1 = __nccwpck_require__(3744);
+const crosscheck_1 = __nccwpck_require__(9059);
+const review_1 = __nccwpck_require__(5086);
+const verify_1 = __nccwpck_require__(9071);
+const posting_1 = __nccwpck_require__(6476);
+const pool_1 = __nccwpck_require__(8506);
+const INVALID_COMMAND_HELP = `❌ Invalid command format. Valid formats are:
+- \`/bot-review\` - Review latest changes
+- \`/bot-review: <commit-sha>\` - Review a single commit
+- \`/bot-review: <base>..<head>\` - Review a commit range`;
+async function run() {
+    const cfg = (0, config_1.loadConfig)();
+    const keyError = (0, config_1.validateApiKeys)(cfg);
+    if (keyError) {
+        core.setFailed(keyError);
+        return;
+    }
+    const octokit = new rest_1.Octokit({ auth: cfg.githubToken });
+    const eventData = (0, github_1.readEventData)();
+    const pr = await (0, github_1.getPRDetails)(octokit, eventData);
+    const commentTrigger = (0, github_1.isCommentTrigger)();
+    if (commentTrigger && cfg.reviewMode === "invalid") {
+        await (0, github_1.postIssueComment)(octokit, pr, INVALID_COMMAND_HELP);
+        return;
+    }
+    let diff;
     try {
-        console.log("GITHUB_EVENT_PATH:", process.env.GITHUB_EVENT_PATH);
-        const eventPath = process.env.GITHUB_EVENT_PATH || "";
-        if (!eventPath) {
-            throw new Error("GITHUB_EVENT_PATH environment variable is not set");
-        }
-        const eventData = JSON.parse((0, fs_1.readFileSync)(eventPath, "utf8"));
-        console.log("Event type:", process.env.GITHUB_EVENT_NAME);
-        if (process.env.GITHUB_EVENT_NAME === "issue_comment") {
-            if (!eventData.issue || !eventData.issue.pull_request) {
-                throw new Error("Comment is not on a pull request");
-            }
-            const prUrl = eventData.issue.pull_request.url;
-            console.log("PR URL from comment:", prUrl);
-            const urlParts = prUrl.split('/');
-            const number = parseInt(urlParts[urlParts.length - 1], 10);
-            const repo = urlParts[urlParts.length - 3];
-            const owner = urlParts[urlParts.length - 4];
-            console.log(`Extracted PR info - owner: ${owner}, repo: ${repo}, number: ${number}`);
-            const prResponse = await octokit.pulls.get({
-                owner,
-                repo,
-                pull_number: number,
-            });
-            return {
-                owner,
-                repo,
-                pull_number: number,
-                title: (_a = prResponse.data.title) !== null && _a !== void 0 ? _a : "",
-                description: (_b = prResponse.data.body) !== null && _b !== void 0 ? _b : "",
-            };
-        }
-        if (!eventData.repository || !eventData.repository.owner) {
-            console.log("Event data:", JSON.stringify(eventData, null, 2));
-            throw new Error("Invalid event data: missing repository information");
-        }
-        const repository = eventData.repository;
-        const number = eventData.number || ((_c = eventData.pull_request) === null || _c === void 0 ? void 0 : _c.number);
-        if (!number) {
-            console.log("Event data:", JSON.stringify(eventData, null, 2));
-            throw new Error("Invalid event data: missing pull request number");
-        }
-        console.log(`PR info - owner: ${repository.owner.login}, repo: ${repository.name}, number: ${number}`);
-        const prResponse = await octokit.pulls.get({
-            owner: repository.owner.login,
-            repo: repository.name,
-            pull_number: number,
-        });
-        return {
-            owner: repository.owner.login,
-            repo: repository.name,
-            pull_number: number,
-            title: (_d = prResponse.data.title) !== null && _d !== void 0 ? _d : "",
-            description: (_e = prResponse.data.body) !== null && _e !== void 0 ? _e : "",
-        };
+        diff = await (0, github_1.getDiff)(octokit, cfg, pr, eventData);
     }
     catch (error) {
-        console.error("Error in getPRDetails:", error);
-        if (error instanceof Error) {
-            throw new Error(`Failed to get PR details: ${error.message}`);
+        if ((0, github_1.isPermissionError)(error) && commentTrigger) {
+            await (0, github_1.postIssueComment)(octokit, pr, "❌ Review failed: Insufficient permissions to access repository data. Please check the GitHub token permissions.");
         }
-        throw new Error(`Failed to get PR details: ${String(error)}`);
+        throw error;
     }
-}
-async function getDiff(owner, repo, pull_number) {
-    const response = await octokit.pulls.get({
-        owner,
-        repo,
-        pull_number,
-        mediaType: { format: "diff" },
+    if (diff === null)
+        return; // unsupported event, already logged
+    if (diff.trim() === "")
+        throw new Error("Failed to retrieve diff from GitHub API");
+    const parsedDiff = (0, parse_diff_1.default)(diff);
+    if (!parsedDiff || parsedDiff.length === 0) {
+        throw new Error("Failed to parse diff from GitHub API");
+    }
+    const files = parsedDiff.filter((file) => file.to &&
+        file.to !== "/dev/null" &&
+        !cfg.exclude.some((pattern) => { var _a; return (0, minimatch_1.default)((_a = file.to) !== null && _a !== void 0 ? _a : "", pattern); }));
+    if (files.length === 0) {
+        console.log("No files to review after filtering");
+        if (commentTrigger) {
+            await (0, github_1.upsertSummaryComment)(octokit, pr, "## AI Doc Review\n\n✅ Review completed, no files to review after filtering.");
+        }
+        return;
+    }
+    console.log(`Reviewing ${files.length} file(s)`);
+    const styleGuideSection = (0, prompts_1.loadStyleGuide)(cfg);
+    const failures = [];
+    // Fetch full documents first (also used for verify excerpts later).
+    const fullContents = new Map();
+    await (0, pool_1.mapPool)(files, cfg.concurrency, async (file) => {
+        var _a;
+        fullContents.set((_a = file.to) !== null && _a !== void 0 ? _a : "", await fetchFullContent(octokit, cfg, pr, file));
     });
-    // @ts-expect-error - response.data is a string
-    return response.data;
-}
-async function analyzeCode(parsedDiff, prDetails) {
-    var _a;
-    const comments = [];
-    console.log(`Analyzing ${parsedDiff.length} files from diff:`);
-    for (const file of parsedDiff) {
-        console.log(`- File: ${file.to || '[deleted]'}, chunks: ${((_a = file.chunks) === null || _a === void 0 ? void 0 : _a.length) || 0}`);
+    // --- Deterministic checks (no LLM): run in parallel with the LLM stages
+    const checksPromise = (0, checks_1.runChecks)(files.map((file) => {
+        var _a, _b;
+        const p = (_a = file.to) !== null && _a !== void 0 ? _a : "";
+        return {
+            path: p,
+            file,
+            fullContent: (_b = fullContents.get(p)) !== null && _b !== void 0 ? _b : null,
+            isNew: file.from === "/dev/null" || file.new === true,
+        };
+    }), buildCheckDeps(octokit, cfg, pr));
+    // --- Digest stage: PR-wide intent + structured claims ------------------
+    let digestText = "";
+    let digestSummary = "";
+    let digestClaims = null;
+    try {
+        digestClaims = await (0, digest_1.runDigest)(cfg, files, pr);
+        digestText = (0, digest_1.digestToText)(digestClaims);
+        digestSummary = digestText;
     }
-    for (const file of parsedDiff) {
-        const filePath = file.to;
-        if (!filePath || filePath === "/dev/null")
-            continue; // Ignore deleted files and files without path
+    catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(`Digest stage failed (continuing without it): ${message}`);
+        failures.push(`digest stage: ${message}`);
+    }
+    // --- Review stage: one call per file, full document + digest as context
+    const perFile = await (0, pool_1.mapPool)(files, cfg.concurrency, async (file) => {
+        var _a, _b, _c;
+        const path = (_a = file.to) !== null && _a !== void 0 ? _a : "";
+        try {
+            const findings = await (0, review_1.reviewFile)(cfg, pr, file, {
+                fullContent: (_b = fullContents.get(path)) !== null && _b !== void 0 ? _b : null,
+                digestText,
+                styleGuideSection,
+                language: (0, prompts_1.detectLanguage)(path, (_c = fullContents.get(path)) !== null && _c !== void 0 ? _c : null, cfg.docLanguage || undefined),
+            });
+            return { findings, failure: null };
+        }
+        catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.error(`Review failed for ${path}: ${message}`);
+            return { findings: [], failure: `\`${path}\`: ${message}` };
+        }
+    });
+    let findings = perFile.flatMap((r) => r.findings);
+    const fileFailures = perFile.filter((r) => r.failure !== null).length;
+    failures.push(...perFile.flatMap((r) => (r.failure ? [r.failure] : [])));
+    // --- Cross-check stage: contradictions between files -------------------
+    if (digestClaims) {
+        try {
+            const crossFindings = await (0, crosscheck_1.runCrosscheck)(cfg, digestClaims);
+            if (crossFindings.length > 0) {
+                console.log(`Cross-check found ${crossFindings.length} inconsistency(ies)`);
+                findings = findings.concat(crossFindings);
+            }
+        }
+        catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.error(`Cross-check stage failed (continuing): ${message}`);
+            failures.push(`cross-check stage: ${message}`);
+        }
+    }
+    // --- Verify stage: fact-check candidates before posting ----------------
+    const droppedByVerify = [];
+    if (findings.length > 0) {
+        try {
+            const getExcerpt = buildExcerptProvider(files, fullContents);
+            const outcome = await (0, verify_1.runVerify)(cfg, findings, getExcerpt);
+            findings = outcome.kept;
+            droppedByVerify.push(...outcome.dropped);
+        }
+        catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.error(`Verify stage failed, posting findings unverified: ${message}`);
+            failures.push(`verify stage (findings posted unverified): ${message}`);
+        }
+    }
+    // --- Deterministic check results (skip verify; still validated/deduped)
+    const checkResults = await checksPromise;
+    if (checkResults.findings.length > 0) {
+        console.log(`Deterministic checks produced ${checkResults.findings.length} finding(s)`);
+        findings = findings.concat(checkResults.findings);
+    }
+    failures.push(...checkResults.failures);
+    // --- Posting stage: validate, dedupe, post, report ---------------------
+    // Order matters: remap line numbers first, then dedupe against the
+    // comments already on the PR using the final (remapped) line numbers.
+    const batchDeduped = (0, posting_1.dedupeWithinBatch)(findings);
+    const validated = (0, posting_1.validateFindings)(batchDeduped.unique, (0, context_1.buildCommentableLines)(files));
+    const rerunDeduped = (0, posting_1.dedupeAgainstExisting)(validated.kept, await (0, github_1.listReviewComments)(octokit, pr));
+    const survivingKeys = new Set(rerunDeduped.unique.map((f) => `${f.path}:${f.line}`));
+    const finalComments = validated.comments.filter((c) => survivingKeys.has(`${c.path}:${c.line}`));
+    const finalKept = rerunDeduped.unique;
+    const degraded = validated.degraded;
+    const droppedCount = batchDeduped.dropped.length + rerunDeduped.dropped.length;
+    if (finalComments.length > 0) {
+        await (0, github_1.postReview)(octokit, pr, finalComments);
+    }
+    await (0, github_1.upsertSummaryComment)(octokit, pr, buildSummary({
+        digestSummary,
+        filesReviewed: files.length - fileFailures,
+        filesTotal: files.length,
+        posted: finalKept,
+        degraded,
+        droppedCount: droppedCount + droppedByVerify.length,
+        verifyDropped: droppedByVerify,
+        failures,
+    }));
+    console.log(`Done: ${finalKept.length} comment(s) posted, ${degraded.length} degraded, ${droppedCount + droppedByVerify.length} dropped, ${failures.length} failure(s)`);
+}
+/** Fetch the full file at the PR head; null when too large or unavailable. */
+async function fetchFullContent(octokit, cfg, pr, file) {
+    const path = file.to;
+    if (!path)
+        return null;
+    try {
+        const content = await (0, github_1.getFileContent)(octokit, pr, path, pr.headSha);
+        if (content && content.length / 1024 > cfg.maxFileKb) {
+            console.log(`${path} is ${(content.length / 1024).toFixed(0)}KB (> ${cfg.maxFileKb}KB), reviewing diff hunks only`);
+            return null;
+        }
+        return content;
+    }
+    catch (error) {
+        console.log(`Could not fetch full content for ${path} (${error instanceof Error ? error.message : String(error)}); reviewing diff hunks only`);
+        return null;
+    }
+}
+/** Load and parse the glossary file for the terms check. */
+function loadGlossary(cfg) {
+    if (!cfg.glossaryPath)
+        return [];
+    const p = path_1.default.isAbsolute(cfg.glossaryPath)
+        ? cfg.glossaryPath
+        : path_1.default.resolve(process.cwd(), cfg.glossaryPath);
+    try {
+        const rules = (0, checks_1.parseGlossary)((0, fs_1.readFileSync)(p, "utf8"));
+        console.log(`Loaded ${rules.length} terminology rule(s) from ${p}`);
+        return rules;
+    }
+    catch {
+        core.warning(`Glossary file not found at: ${p}. Terms check disabled.`);
+        return [];
+    }
+}
+/** Wire the side-effecting operations the deterministic checks need. */
+function buildCheckDeps(octokit, cfg, pr) {
+    const contentCache = new Map();
+    const readFileAtHead = (p) => {
+        if (!contentCache.has(p)) {
+            contentCache.set(p, (0, github_1.getFileContent)(octokit, pr, p, pr.headSha).catch((error) => {
+                console.log(`Could not read ${p} at head: ${error instanceof Error ? error.message : String(error)}`);
+                return null;
+            }));
+        }
+        return contentCache.get(p);
+    };
+    return {
+        fileExistsAtHead: async (p) => (await readFileAtHead(p)) !== null,
+        readFileAtHead,
+        searchRepo: async (query) => {
+            const result = await octokit.search.code({
+                q: `${query} repo:${pr.owner}/${pr.repo}`,
+                per_page: 20,
+            });
+            return result.data.items.map((item) => item.path);
+        },
+        searchCode: async (query) => {
+            const result = await octokit.search.code({ q: query, per_page: 1 });
+            return result.data.total_count;
+        },
+        glossary: loadGlossary(cfg),
+        tocPath: cfg.tocPath,
+        codeRepo: cfg.codeRepo,
+        docLanguage: cfg.docLanguage,
+        enabled: cfg.checks,
+    };
+}
+/**
+ * Excerpt provider for the verify stage: prefer the full document (±2 lines
+ * around the finding), fall back to the lines visible in the diff.
+ */
+function buildExcerptProvider(files, fullContents) {
+    var _a;
+    const diffLines = new Map();
+    for (const file of files) {
+        if (!file.to)
+            continue;
+        const byLine = (_a = diffLines.get(file.to)) !== null && _a !== void 0 ? _a : new Map();
         for (const chunk of file.chunks) {
-            const { prompt } = createPrompt(file, chunk, prDetails);
-            // Get starting line number safely by checking the type of change
-            const firstChange = chunk.changes[0] || {};
-            let startLine = 'unknown';
-            if ('ln' in firstChange) {
-                startLine = String(firstChange.ln);
+            for (const change of chunk.changes) {
+                if (change.type === "add")
+                    byLine.set(change.ln, change.content.slice(1));
+                else if (change.type === "normal")
+                    byLine.set(change.ln2, change.content.slice(1));
             }
-            else if ('ln2' in firstChange) {
-                startLine = String(firstChange.ln2);
+        }
+        diffLines.set(file.to, byLine);
+    }
+    const fullLines = new Map();
+    for (const [path, content] of fullContents) {
+        if (content)
+            fullLines.set(path, content.split("\n"));
+    }
+    return (path, line) => {
+        const full = fullLines.get(path);
+        if (full) {
+            const start = Math.max(1, line - 2);
+            const end = Math.min(full.length, line + 2);
+            const rows = [];
+            for (let n = start; n <= end; n++)
+                rows.push(`${n}: ${full[n - 1]}`);
+            return rows.join("\n");
+        }
+        const byLine = diffLines.get(path);
+        if (!byLine)
+            return "";
+        const rows = [];
+        for (let n = line - 2; n <= line + 2; n++) {
+            const text = byLine.get(n);
+            if (text !== undefined)
+                rows.push(`${n}: ${text}`);
+        }
+        return rows.join("\n");
+    };
+}
+function buildSummary(input) {
+    const lines = ["## AI Doc Review", ""];
+    if (input.digestSummary) {
+        lines.push("### What this PR changes", "", input.digestSummary, "");
+    }
+    if (input.failures.length === 0 &&
+        input.posted.length === 0 &&
+        input.degraded.length === 0) {
+        lines.push("✅ Review completed, no issues found.");
+    }
+    else {
+        lines.push(`Reviewed ${input.filesReviewed}/${input.filesTotal} file(s): ` +
+            `**${input.posted.length}** inline comment(s) posted` +
+            (input.droppedCount > 0
+                ? `, ${input.droppedCount} filtered or duplicate`
+                : "") +
+            (input.failures.length > 0
+                ? `, **${input.failures.length} failure(s)**`
+                : "") +
+            ".");
+    }
+    if (input.degraded.length > 0) {
+        lines.push("", "### Findings that could not be anchored to the diff", "");
+        for (const f of input.degraded) {
+            lines.push(`- \`${f.path}\` (line ~${f.line}): ${(0, posting_1.formatBody)(f)}`);
+        }
+    }
+    if (input.failures.length > 0) {
+        lines.push("", "### ❌ Failures", "");
+        for (const f of input.failures)
+            lines.push(`- ${f}`);
+    }
+    return lines.join("\n");
+}
+run().catch(async (error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    core.setFailed(`Error in AI Review: ${message}`);
+    console.error("Error details:", error);
+    // Best-effort error feedback on the PR for comment-triggered runs.
+    try {
+        if ((0, github_1.isCommentTrigger)()) {
+            const cfg = (0, config_1.loadConfig)();
+            const octokit = new rest_1.Octokit({ auth: cfg.githubToken });
+            const pr = await (0, github_1.getPRDetails)(octokit, (0, github_1.readEventData)());
+            await (0, github_1.postIssueComment)(octokit, pr, `❌ AI review failed: ${message}`);
+        }
+    }
+    catch (nested) {
+        console.error("Failed to post error comment:", nested);
+    }
+});
+
+
+/***/ }),
+
+/***/ 9059:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.runCrosscheck = exports.findComparableGroups = void 0;
+const config_1 = __nccwpck_require__(88);
+const client_1 = __nccwpck_require__(2852);
+const schemas_1 = __nccwpck_require__(8285);
+/**
+ * Cross-check stage: compare the extracted claims across files and report
+ * contradictions (different defaults, ranges, or terminology for the same
+ * thing). Runs on the structured claims table — the comparison input is
+ * small and grouped, which keeps this reliable.
+ */
+/** Claims worth comparing, grouped by "type:name", only when 2+ files disagree-able. */
+function groupClaims(claims) {
+    var _a;
+    const groups = new Map();
+    for (const claim of claims) {
+        const key = `${claim.type}:${claim.name.toLowerCase()}`;
+        const group = (_a = groups.get(key)) !== null && _a !== void 0 ? _a : [];
+        group.push(claim);
+        groups.set(key, group);
+    }
+    return groups;
+}
+/** Only groups spanning at least two distinct files can contradict. */
+function findComparableGroups(digest) {
+    const comparable = [];
+    for (const group of groupClaims(digest.claims).values()) {
+        const files = new Set(group.map((c) => c.file));
+        if (files.size >= 2)
+            comparable.push(group);
+    }
+    return comparable;
+}
+exports.findComparableGroups = findComparableGroups;
+function buildCrosscheckPrompt(groups) {
+    const rendered = groups
+        .map((group, i) => `Group ${i + 1} (${group[0].type} "${group[0].name}"):\n` +
+        group
+            .map((c) => `- ${c.file}${c.line !== null ? `:${c.line}` : ""} says: ${c.value}`)
+            .join("\n"))
+        .join("\n\n");
+    return `You are checking a documentation pull request for cross-file inconsistencies. Below are claims extracted from the changed files, grouped by name. Identify genuine contradictions: the same name described with conflicting values or meanings in different files (for example different default values, different valid ranges, or inconsistent definitions of the same term).
+
+Do NOT report:
+- Claims that are consistent or merely phrased differently.
+- Different things that happen to share a similar name.
+- Style or wording issues (those are handled elsewhere).
+
+Respond with JSON only:
+{"inconsistencies": [{"file": "<file to anchor the comment on>", "line": <line in that file>, "comment": "<explain the contradiction and name BOTH files>", "severity": "high|medium|low", "category": "accuracy|terminology"}]}
+
+Only report genuine contradictions; return an empty array if there are none.
+
+Claim groups:
+
+${rendered}`;
+}
+async function runCrosscheck(cfg, digest) {
+    const groups = findComparableGroups(digest);
+    if (groups.length === 0)
+        return [];
+    const { findings } = await (0, client_1.chatJson)(cfg, {
+        model: (0, config_1.mainModel)(cfg),
+        prompt: buildCrosscheckPrompt(groups),
+        maxTokens: Math.min(cfg.maxTokens, 2048),
+        temperature: 0,
+    }, schemas_1.validateInconsistencies);
+    return findings;
+}
+exports.runCrosscheck = runCrosscheck;
+
+
+/***/ }),
+
+/***/ 3744:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.digestToText = exports.runDigest = void 0;
+const config_1 = __nccwpck_require__(88);
+const client_1 = __nccwpck_require__(2852);
+const schemas_1 = __nccwpck_require__(8285);
+/**
+ * Digest stage: one cheap call over the whole PR producing
+ *  - a short intent summary,
+ *  - a per-file summary,
+ *  - a structured "claims" table (terms, defaults, ranges, versions,
+ *    commands) used later for cross-file consistency checking.
+ *
+ * extract-then-compare: the model is good at extracting structured claims
+ * per file; comparing them afterwards is then trivial and reliable.
+ */
+const PER_FILE_DIFF_CAP = 8000;
+const TOTAL_DIFF_CAP = 60000;
+const MAX_CLAIMS = 50;
+function buildDigestPrompt(files, pr) {
+    const sections = [];
+    let budget = TOTAL_DIFF_CAP;
+    for (const file of files) {
+        if (budget <= 0)
+            break;
+        let diffText = file.chunks
+            .map((chunk) => {
+            const changes = chunk.changes
+                .map((c) => {
+                const line = c.type === "del" ? c.ln : c.type === "add" ? c.ln : c.ln2;
+                return `${line} ${c.content}`;
+            })
+                .join("\n");
+            return `${chunk.content}\n${changes}`;
+        })
+            .join("\n");
+        if (diffText.length > Math.min(PER_FILE_DIFF_CAP, budget)) {
+            diffText =
+                diffText.slice(0, Math.min(PER_FILE_DIFF_CAP, budget)) +
+                    "\n... (diff truncated)";
+        }
+        budget -= diffText.length;
+        sections.push(`<file path="${file.to}">\n${diffText}\n</file>`);
+    }
+    return `You are analyzing a documentation pull request. Produce a JSON digest with this structure:
+
+{"intent": "<2-3 sentences describing what the PR does>", "files": [{"path": "<file path>", "summary": "<one sentence on what changed>"}], "claims": [{"type": "term|parameter|default|range|version|command", "name": "<the term/parameter/command name>", "value": "<the statement made about it>", "file": "<file path>", "line": <line number in the new file, or null>}]}
+
+Claims are statements the documentation makes that could be checked for consistency across files: defined terms, parameter default values, valid ranges, version numbers, command names, paths.
+Extract at most ${MAX_CLAIMS} claims, only meaningful ones. Respond with JSON only.
+
+Pull request title: ${pr.title}
+Pull request description:
+
+---
+${pr.description}
+---
+
+Changed files and their diffs (line numbers refer to the new file):
+
+${sections.join("\n\n")}`;
+}
+async function runDigest(cfg, files, pr) {
+    const { digest } = await (0, client_1.chatJson)(cfg, {
+        model: (0, config_1.helperModel)(cfg),
+        prompt: buildDigestPrompt(files, pr),
+        maxTokens: Math.min(cfg.maxTokens, 4096),
+        temperature: 0,
+    }, schemas_1.validateDigest);
+    return digest;
+}
+exports.runDigest = runDigest;
+/** Compact text rendering of the digest, injected into per-file review prompts. */
+function digestToText(digest) {
+    const lines = [];
+    if (digest.intent)
+        lines.push(`Intent: ${digest.intent}`);
+    for (const f of digest.files) {
+        lines.push(`- ${f.path}: ${f.summary}`);
+    }
+    return lines.join("\n");
+}
+exports.digestToText = digestToText;
+
+
+/***/ }),
+
+/***/ 5086:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.reviewFile = void 0;
+const config_1 = __nccwpck_require__(88);
+const client_1 = __nccwpck_require__(2852);
+const schemas_1 = __nccwpck_require__(8285);
+const prompts_1 = __nccwpck_require__(4272);
+function formatChunkChanges(chunk) {
+    return chunk.changes
+        .map((c) => {
+        const line = c.type === "del" ? c.ln : c.type === "add" ? c.ln : c.ln2;
+        return `${line} ${c.content}`;
+    })
+        .join("\n");
+}
+function formatFileDiff(file) {
+    const diffContent = file.chunks.map((c) => c.content).join("\n");
+    const diffChanges = file.chunks.map(formatChunkChanges).join("\n");
+    return { diffContent, diffChanges };
+}
+const SYSTEM_PROMPT = "You are an expert technical writer who provides detailed, helpful documentation reviews in JSON format.";
+/** Review one file; returns findings (empty only when the model truly found none). */
+async function reviewFile(cfg, pr, file, ctx) {
+    var _a;
+    const template = (0, prompts_1.loadPromptTemplate)(cfg, ctx.language);
+    const { diffContent, diffChanges } = formatFileDiff(file);
+    const prompt = (0, prompts_1.renderTemplate)(template, {
+        filename: (_a = file.to) !== null && _a !== void 0 ? _a : "",
+        title: pr.title,
+        description: pr.description,
+        diff_content: diffContent,
+        diff_changes: diffChanges,
+        digest: (0, prompts_1.digestSection)(ctx.digestText),
+        style_guide: ctx.styleGuideSection,
+        full_content: (0, prompts_1.fullContentSection)(ctx.fullContent),
+    }) +
+        `\n\nThe documentation is written in ${(0, prompts_1.languageName)(ctx.language)}. Write every review comment and suggestion in that language.`;
+    const { reviews } = await (0, client_1.chatJson)(cfg, {
+        model: (0, config_1.mainModel)(cfg),
+        system: SYSTEM_PROMPT,
+        prompt,
+        maxTokens: cfg.maxTokens,
+    }, (u) => { var _a; return (0, schemas_1.validateReviews)(u, (_a = file.to) !== null && _a !== void 0 ? _a : ""); });
+    return reviews;
+}
+exports.reviewFile = reviewFile;
+
+
+/***/ }),
+
+/***/ 9071:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.runVerify = void 0;
+const config_1 = __nccwpck_require__(88);
+const client_1 = __nccwpck_require__(2852);
+const schemas_1 = __nccwpck_require__(8285);
+/**
+ * Verify stage: re-check every candidate finding against its source excerpt
+ * before anything is posted. This is the noise-control knob that makes it
+ * safe to run higher-recall review stages. Findings below the confidence
+ * threshold are dropped with a reason.
+ */
+const KEEP_CONFIDENCE_THRESHOLD = 50;
+const BATCH_SIZE = 20;
+function buildVerifyPrompt(candidates) {
+    const rendered = candidates
+        .map((c) => `{"id": ${c.id}, "file": ${JSON.stringify(c.finding.path)}, "line": ${c.finding.line}, "category": ${JSON.stringify(c.finding.category)}, "comment": ${JSON.stringify(c.finding.comment)}, "excerpt": ${JSON.stringify(c.excerpt)}}`)
+        .join("\n");
+    return `You are verifying candidate documentation review findings before they are posted to a pull request. For each candidate, decide whether it is a genuine, actionable issue.
+
+Drop a candidate when:
+- The comment is factually wrong or contradicts the excerpt.
+- It nitpicks something that is already correct and clear.
+- It misreads Markdown syntax or code-block content as prose.
+
+Keep genuine issues of accuracy, logic, clarity, terminology, or structure.
+
+Respond with JSON only:
+{"verdicts": [{"id": <number>, "keep": <true|false>, "confidence": <0-100>, "reason": "<one short sentence>"}]}
+
+Candidates (one per line):
+
+${rendered}`;
+}
+/**
+ * Verify findings in batches. Fail-open design: callers decide what to do
+ * when this stage throws (the failure is reported in the summary).
+ */
+async function runVerify(cfg, findings, getExcerpt) {
+    const kept = [];
+    const dropped = [];
+    if (findings.length === 0)
+        return { kept, dropped };
+    const candidates = findings.map((finding, id) => ({
+        id,
+        finding,
+        excerpt: getExcerpt(finding.path, finding.line),
+    }));
+    for (let i = 0; i < candidates.length; i += BATCH_SIZE) {
+        const batch = candidates.slice(i, i + BATCH_SIZE);
+        const { verdicts } = await (0, client_1.chatJson)(cfg, {
+            model: (0, config_1.helperModel)(cfg),
+            prompt: buildVerifyPrompt(batch),
+            maxTokens: Math.min(cfg.maxTokens, 2048),
+            temperature: 0,
+        }, schemas_1.validateVerdicts);
+        const byId = new Map(verdicts.map((v) => [v.id, v]));
+        for (const candidate of batch) {
+            const verdict = byId.get(candidate.id);
+            if (!verdict) {
+                // Missing verdict: keep the finding but say so (never a silent drop).
+                kept.push(candidate.finding);
+                continue;
             }
-            console.log(`Sending to AI - File: ${filePath}, Chunk starting at line: ${startLine}`);
-            console.log(`AI Prompt preview (first 500 chars): ${prompt.substring(0, 500)}...`);
-            const aiResponse = await getAIResponse(prompt);
-            if (aiResponse) {
-                const newComments = createComment(file, chunk, aiResponse);
-                if (newComments) {
-                    comments.push(...newComments);
-                }
+            if (verdict.keep && verdict.confidence >= KEEP_CONFIDENCE_THRESHOLD) {
+                kept.push(candidate.finding);
+            }
+            else {
+                dropped.push({
+                    finding: candidate.finding,
+                    reason: verdict.reason ||
+                        `filtered by verification (confidence ${verdict.confidence})`,
+                });
             }
         }
     }
-    return comments;
+    return { kept, dropped };
 }
-function createPrompt(file, chunk, prDetails) {
-    // Default prompt template that will be used if the file doesn't exist
-    const defaultPromptTemplate = `As a technical writer who has profound knowledge, your task is to review pull requests of user documentation.
+exports.runVerify = runVerify;
+
+
+/***/ }),
+
+/***/ 6476:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.dedupeAgainstExisting = exports.dedupeWithinBatch = exports.validateFindings = exports.formatBody = void 0;
+const context_1 = __nccwpck_require__(3842);
+/**
+ * Turn findings into GitHub comments safely:
+ * - validate every line number against the parsed diff (never send a line
+ *   that GitHub would reject with a 422, sinking the whole review);
+ * - remap near-miss line numbers onto the closest added line;
+ * - degrade unmappable findings to the summary instead of dropping them;
+ * - dedupe within the batch and against existing bot comments (re-runs).
+ */
+const SEVERITY_RANK = { high: 3, medium: 2, low: 1 };
+function formatBody(f) {
+    const header = `[${f.severity} · ${f.category}] `;
+    if (!f.suggestion)
+        return `${header}${f.comment}`;
+    // Four backticks so the body survives suggestions containing ``` fences.
+    return `${header}${f.comment}\n\n\`\`\`\`suggestion\n${f.suggestion}\n\`\`\`\``;
+}
+exports.formatBody = formatBody;
+function validateFindings(findings, commentable) {
+    const comments = [];
+    const kept = [];
+    const degraded = [];
+    for (const f of findings) {
+        const entry = commentable.get(f.path);
+        let line = f.line;
+        if (!(entry === null || entry === void 0 ? void 0 : entry.commentable.has(line))) {
+            const remapped = (0, context_1.remapLine)(entry, line);
+            if (remapped === null) {
+                degraded.push(f);
+                continue;
+            }
+            line = remapped;
+        }
+        const comment = {
+            path: f.path,
+            line,
+            side: "RIGHT",
+            body: formatBody({ ...f, line }),
+        };
+        // Multi-line suggestion: GitHub uses start_line..line. endLine in a
+        // Finding is the inclusive end, so it becomes the comment's `line`.
+        if (f.endLine && f.endLine > line) {
+            const endOk = entry === null || entry === void 0 ? void 0 : entry.commentable.has(f.endLine);
+            if (endOk) {
+                comment.start_line = line;
+                comment.start_side = "RIGHT";
+                comment.line = f.endLine;
+            }
+        }
+        comments.push(comment);
+        kept.push({ ...f, line: comment.line });
+    }
+    return { comments, kept, degraded };
+}
+exports.validateFindings = validateFindings;
+/** Drop duplicates inside one batch: same path+line keeps the highest severity. */
+function dedupeWithinBatch(findings) {
+    const byKey = new Map();
+    const dropped = [];
+    for (const f of findings) {
+        const key = `${f.path}:${f.line}`;
+        const prev = byKey.get(key);
+        if (!prev) {
+            byKey.set(key, f);
+            continue;
+        }
+        if (SEVERITY_RANK[f.severity] > SEVERITY_RANK[prev.severity]) {
+            dropped.push({
+                finding: prev,
+                reason: "duplicate of a higher-severity finding",
+            });
+            byKey.set(key, f);
+        }
+        else {
+            dropped.push({
+                finding: f,
+                reason: `duplicate of an existing finding on ${key}`,
+            });
+        }
+    }
+    return { unique: [...byKey.values()], dropped };
+}
+exports.dedupeWithinBatch = dedupeWithinBatch;
+/** Drop findings already posted by a bot on the same path+line (re-runs). */
+function dedupeAgainstExisting(findings, existing) {
+    const taken = new Set(existing
+        .filter((c) => c.isBot && c.line !== undefined)
+        .map((c) => `${c.path}:${c.line}`));
+    const unique = [];
+    const dropped = [];
+    for (const f of findings) {
+        if (taken.has(`${f.path}:${f.line}`)) {
+            dropped.push({ finding: f, reason: "already posted on a previous run" });
+        }
+        else {
+            unique.push(f);
+        }
+    }
+    return { unique, dropped };
+}
+exports.dedupeAgainstExisting = dedupeAgainstExisting;
+
+
+/***/ }),
+
+/***/ 4272:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.digestSection = exports.fullContentSection = exports.loadStyleGuide = exports.loadPromptTemplate = exports.renderTemplate = exports.DEFAULT_PROMPT_ZH = exports.DEFAULT_PROMPT_EN = exports.languageVariantPath = exports.languageName = exports.detectLanguage = void 0;
+const fs_1 = __nccwpck_require__(7147);
+const path_1 = __importDefault(__nccwpck_require__(1017));
+const core = __importStar(__nccwpck_require__(2186));
+/**
+ * Path-based language conventions: `/zh/`, `docs/ja/guide.md`,
+ * `guide_fr.md`, `guide.fr.md`, `i18n/de/...`. A language code must appear
+ * as a full path segment or be delimited by `_-.` to avoid matching words
+ * like "design" (de) or "portal" (pt).
+ */
+const PATH_LANGUAGE_RULES = [
+    [/(^|[\/_.-])zh([-_]?cn|[-_]?hans)?([\/_.-]|$)/i, "zh"],
+    [/(^|[\/_.-])(ja|jp|ja[-_]jp)([\/_.-]|$)/i, "ja"],
+    [/(^|[\/_.-])(ko|kr|ko[-_]kr)([\/_.-]|$)/i, "ko"],
+    [/(^|[\/_.-])(fr|fr[-_]fr)([\/_.-]|$)/i, "fr"],
+    [/(^|[\/_.-])(de|de[-_]de)([\/_.-]|$)/i, "de"],
+    [/(^|[\/_.-])(es|es[-_]es)([\/_.-]|$)/i, "es"],
+    [/(^|[\/_.-])(pt|pt[-_]br|pt[-_]pt)([\/_.-]|$)/i, "pt"],
+    [/(^|[\/_.-])(it|it[-_]it)([\/_.-]|$)/i, "it"],
+    [/(^|[\/_.-])(nl|nl[-_]nl)([\/_.-]|$)/i, "nl"],
+    [/(^|[\/_.-])(ru|ru[-_]ru)([\/_.-]|$)/i, "ru"],
+    [/(^|[\/_.-])(ar|ar[-_]sa)([\/_.-]|$)/i, "ar"],
+];
+function countMatches(content, re) {
+    var _a;
+    return ((_a = content.match(re)) !== null && _a !== void 0 ? _a : []).length;
+}
+/**
+ * Script-based detection. Order matters: kana marks Japanese before the
+ * Han check (Chinese docs contain no kana), Hangul marks Korean. This
+ * ordering is what keeps zh-only rules away from Japanese documents.
+ */
+function detectByScript(content) {
+    if (countMatches(content, /[぀-ヿ]/g) >= 2)
+        return "ja";
+    if (countMatches(content, /[가-힯]/g) >= 2)
+        return "ko";
+    if (countMatches(content, /[一-鿿]/g) > 20)
+        return "zh";
+    if (countMatches(content, /[Ѐ-ӿ]/g) > 20)
+        return "ru";
+    if (countMatches(content, /[؀-ۿ]/g) > 20)
+        return "ar";
+    if (countMatches(content, /[฀-๿]/g) > 10)
+        return "th";
+    if (countMatches(content, /[ऀ-ॿ]/g) > 10)
+        return "hi";
+    return null;
+}
+/** Stop-word scoring for Latin-script languages (fr/de/es). */
+const STOPWORDS = [
+    [
+        "fr",
+        [
+            "le",
+            "la",
+            "les",
+            "des",
+            "une",
+            "est",
+            "dans",
+            "pour",
+            "avec",
+            "vous",
+            "nous",
+            "cette",
+        ],
+    ],
+    [
+        "de",
+        [
+            "der",
+            "die",
+            "das",
+            "und",
+            "ist",
+            "für",
+            "mit",
+            "eine",
+            "einer",
+            "nicht",
+            "sie",
+            "den",
+        ],
+    ],
+    [
+        "es",
+        [
+            "el",
+            "la",
+            "los",
+            "las",
+            "una",
+            "es",
+            "para",
+            "con",
+            "por",
+            "esta",
+            "este",
+            "como",
+        ],
+    ],
+];
+function detectByStopwords(content) {
+    var _a, _b;
+    const sample = content.slice(0, 5000).toLowerCase();
+    const scores = STOPWORDS.map(([lang, words]) => [
+        lang,
+        words.reduce((sum, w) => sum + countMatches(sample, new RegExp(`\\b${w}\\b`, "g")), 0),
+    ]);
+    scores.sort((a, b) => b[1] - a[1]);
+    const [topLang, topScore] = scores[0];
+    const secondScore = (_b = (_a = scores[1]) === null || _a === void 0 ? void 0 : _a[1]) !== null && _b !== void 0 ? _b : 0;
+    // Conservative: require enough hits and a clear margin, else fall back.
+    if (topScore >= 5 && topScore >= secondScore + 3)
+        return topLang;
+    return null;
+}
+/**
+ * Detect the documentation language of a file.
+ * Precedence: explicit override → path conventions → script heuristics →
+ * stop-word scoring → "en". Latin-script languages other than fr/de/es are
+ * not distinguishable from English by heuristics; use path conventions or
+ * the DOC_LANGUAGE override for those.
+ */
+function detectLanguage(filePath, content, override) {
+    if (override)
+        return override;
+    for (const [re, lang] of PATH_LANGUAGE_RULES) {
+        if (re.test(filePath))
+            return lang;
+    }
+    if (content) {
+        const byScript = detectByScript(content);
+        if (byScript)
+            return byScript;
+        const byStopwords = detectByStopwords(content);
+        if (byStopwords)
+            return byStopwords;
+    }
+    return "en";
+}
+exports.detectLanguage = detectLanguage;
+const LANGUAGE_NAMES = {
+    en: "English",
+    zh: "Chinese",
+    ja: "Japanese",
+    ko: "Korean",
+    fr: "French",
+    de: "German",
+    es: "Spanish",
+    pt: "Portuguese",
+    it: "Italian",
+    nl: "Dutch",
+    ru: "Russian",
+    ar: "Arabic",
+    th: "Thai",
+    hi: "Hindi",
+};
+/** Display name of a language code, for prompt instructions. */
+function languageName(lang) {
+    var _a;
+    return (_a = LANGUAGE_NAMES[lang]) !== null && _a !== void 0 ? _a : lang;
+}
+exports.languageName = languageName;
+/**
+ * Language-specific sibling of a template path:
+ * `prompts/review.txt` + "ja" → `prompts/review.ja.txt`.
+ */
+function languageVariantPath(base, lang) {
+    const ext = path_1.default.extname(base);
+    if (!ext)
+        return `${base}.${lang}`;
+    return `${base.slice(0, -ext.length)}.${lang}${ext}`;
+}
+exports.languageVariantPath = languageVariantPath;
+exports.DEFAULT_PROMPT_EN = `As a technical writer who has profound knowledge of databases, your task is to review pull requests of user documentation.
 
 IMPORTANT: You MUST follow these formatting instructions exactly:
 1. Your response MUST be a valid JSON object with the following structure:
-   {"reviews": [{"lineNumber": <line_number>, "reviewComment": "<review comment>", "suggestion": "<improved version of the original line>"}]}
+   {"reviews": [{"line": <line_number>, "end_line": <optional_line_number>, "severity": "high|medium|low", "category": "accuracy|logic|clarity|terminology|structure|grammar", "comment": "<review comment>", "suggestion": "<improved replacement text>"}]}
 2. Do NOT include any markdown code blocks (like \`\`\`json) around your JSON.
 3. Ensure all JSON keys and values are properly quoted with double quotes.
-4. Escape any double quotes within string values with a backslash (\\").
-5. Do NOT include any explanations or text outside of the JSON object.
+4. Do NOT include any explanations or text outside of the JSON object.
+5. Line numbers refer to the NEW version of the file. Only comment on lines that appear in the diff below.
+6. Use "end_line" only when the suggestion should replace a range of lines (line..end_line inclusive); otherwise omit it.
 
 Review Guidelines:
 - Do not give positive comments or compliments.
-- Do not improve the wording of UI strings or messages returned by CLI.
+- Do not improve the wording of UI strings or messages returned by CLI inside code blocks.
 - Focus on improving the clarity, accuracy, and readability of the content.
-- Ensure the documentation is easy to understand for TiDB users.
+- Ensure the documentation is easy to understand for users.
 - Review not just the wording but also the logic and structure of the content.
-- Review the document in the context of the overall user experience and functionality described.
+- When the full document or a PR-wide digest is provided below, use them to check consistency with the surrounding content and with other changed files. Even then, comment ONLY on lines that appear in the diff.
 - Provide "reviews" ONLY if there is something to improve, otherwise "reviews" should be an empty array.
 - Write the review comment in the language of the documentation.
-- For EVERY review comment of a specific line, "suggestion" MUST be the improved version of the original line. If the beginning of the original line contains Markdown syntax such as blank spaces for indentation, "-", "+", "*" for unordered list, or ">" for notes, keep them unchanged.
+- For EVERY review comment of a specific line, "suggestion" MUST be the improved replacement for the original line(s). If the beginning of the original line contains Markdown syntax such as blank spaces for indentation, "-", "+", "*" for unordered list, or ">" for notes, keep them unchanged.
 
 Example of a valid response:
 
-{"reviews": [{"lineNumber": 42, "reviewComment": "The sentence is not clear enough. It is recommended to clarify the relationship between compression efficiency and compression rate, and to supplement the explanation of the default value.", "suggestion": "Set the compression efficiency of the lz4 compression algorithm used when writing raft log files to raft-engine, ranging from 1 to 16. The lower the value, the higher the compression rate, but the lower the compression rate; the higher the value, the lower the compression rate, but the higher the compression rate. The default value is 1, which means to prioritize compression rate."}]}
+{"reviews": [{"line": 42, "severity": "medium", "category": "clarity", "comment": "The sentence is not clear enough. It is recommended to clarify the relationship between compression speed and compression ratio, and to supplement the explanation of the default value.", "suggestion": "Set the compression efficiency of the lz4 compression algorithm used when writing raft log files to raft-engine, ranging from 1 to 16. The lower the value, the higher the compression speed, but the lower the compression ratio; the higher the value, the lower the compression speed, but the higher the compression ratio. The default value is 1, which means prioritizing compression speed."}]}
 
-Review the following diff in the file "\${filename}" and take the pull request title and description into account when writing the response.
+Review the diff in the file "\${filename}" and take the pull request title and description into account when writing the response.
 
 Pull request title: \${title}
 Pull request description:
@@ -204,6 +2788,9 @@ Pull request description:
 ---
 \${description}
 ---
+\${digest}
+\${style_guide}
+\${full_content}
 
 Git diff to review:
 
@@ -211,678 +2798,151 @@ Git diff to review:
 \${diff_content}
 \${diff_changes}
 \`\`\``;
-    try {
-        // Read the template file from the configured path
-        // If it's a relative path, resolve it from the current working directory
-        const templatePath = path_1.default.isAbsolute(PROMPT_PATH)
-            ? PROMPT_PATH
-            : path_1.default.resolve(process.cwd(), PROMPT_PATH);
-        try {
-            // Check if file exists before trying to read it
-            (0, fs_1.readFileSync)(templatePath, { encoding: 'utf8', flag: 'r' });
-            console.log(`✅ Using custom prompt template from: ${templatePath}`);
-            core.info(`Using custom prompt template from: ${templatePath}`);
-            let template = (0, fs_1.readFileSync)(templatePath, 'utf8');
-            // Replace placeholders with actual values - using global replacement
-            template = template
-                .replace(/\${filename}/g, file.to || '')
-                .replace(/\${title}/g, prDetails.title)
-                .replace(/\${description}/g, prDetails.description)
-                .replace(/\${diff_content}/g, chunk.content)
-                .replace(/\${diff_changes}/g, chunk.changes
-                // @ts-expect-error - ln and ln2 exists where needed
-                .map((c) => `${c.ln ? c.ln : c.ln2} ${c.content}`)
-                .join("\n"));
-            return { prompt: template };
+exports.DEFAULT_PROMPT_ZH = `你是一名精通数据库技术的资深技术文档工程师，你的任务是审校优化用户文档的 Pull Request。
+
+重要：你必须严格遵循以下格式要求：
+
+1. 你的响应必须是一个有效的 JSON 对象，结构如下：
+   {"reviews": [{"line": <行号>, "end_line": <可选行号>, "severity": "high|medium|low", "category": "accuracy|logic|clarity|terminology|structure|grammar", "comment": "<审查意见>", "suggestion": "<改进后的替换文本>"}]}
+2. 不要在你返回的 JSON 前后包含任何 Markdown 代码块（如 \`\`\`json）。
+3. 确保所有 JSON 键和值都用双引号正确引用。
+4. 不要在 JSON 对象之外包含任何解释或文本。
+5. 行号以文件的新版本为准。只评论出现在下方 diff 中的行。
+6. 仅当 suggestion 需要替换连续多行（line..end_line，含两端）时才使用 "end_line"，否则省略。
+
+文档审校准则：
+
+- 请勿提供正面评价或赞美。
+- 请勿改进代码块中 UI 字符串或 CLI 返回消息的措辞。
+- 请专注于提高内容的清晰度、准确性和可读性。
+- 请确保文档对于用户来说易于理解。
+- 请不仅审查措辞，还要审查内容的逻辑和结构是否合理。
+- 当下方提供了完整文档或 PR 级别的变更摘要时，请用它们检查与上下文及其他变更文件的一致性。即便如此，也只评论 diff 中出现的行。
+- 只在文档里有需要改进的地方才提供 "reviews"，否则 "reviews" 应为空数组。
+- 审查意见使用中文撰写。
+- 对于每一行具体的审查意见，"suggestion" 必须是原文的改进版本。如果原文行开头包含 Markdown 语法（如用于缩进的空格、无序列表的 "-"、"+"、"*" 或用于注释的 ">"），请保持它们不变。
+
+有效响应的示例：
+
+{"reviews": [{"line": 42, "severity": "medium", "category": "clarity", "comment": "该句描述不够清晰，建议明确说明压缩速率和压缩率的关系，并补充对默认值的解释。", "suggestion": "设置 raft-engine 在写 raft log 文件时所采用的 lz4 压缩算法的压缩效率，范围 [1, 16]。数值越低，压缩速率越高，但压缩率越低；数值越高，压缩速率越低，但压缩率越高。默认值 1 表示优先考虑压缩速率。"}]}
+
+审查内容为文件 "\${filename}" 中的以下 diff，在撰写响应时请结合 Pull Request 的标题和描述帮助你理解 PR 的主要改动。
+
+Pull Request 标题: \${title}
+Pull Request 描述:
+
+---
+\${description}
+---
+\${digest}
+\${style_guide}
+\${full_content}
+
+需要审查的 Git diff 如下：
+
+\`\`\`diff
+\${diff_content}
+\${diff_changes}
+\`\`\``;
+/** Render a template by replacing all ${var} placeholders; unknowns → "". */
+function renderTemplate(template, vars) {
+    return template.replace(/\$\{(\w+)\}/g, (match, name) => Object.prototype.hasOwnProperty.call(vars, name) ? vars[name] : match);
+}
+exports.renderTemplate = renderTemplate;
+function resolveFromCwd(p) {
+    return path_1.default.isAbsolute(p) ? p : path_1.default.resolve(process.cwd(), p);
+}
+/**
+ * Load the prompt template: custom file when configured and readable,
+ * otherwise the built-in default for the requested language.
+ */
+function loadPromptTemplate(cfg, language) {
+    if (cfg.promptPath) {
+        // Language-specific sibling first: `review.txt` → `review.ja.txt`.
+        const variantPath = resolveFromCwd(languageVariantPath(cfg.promptPath, language));
+        if (variantPath !== resolveFromCwd(cfg.promptPath)) {
+            try {
+                const template = (0, fs_1.readFileSync)(variantPath, "utf8");
+                console.log(`Using language-specific prompt template from: ${variantPath}`);
+                return template;
+            }
+            catch {
+                // no variant for this language; fall through to the base template
+            }
         }
-        catch (fileError) {
-            // File doesn't exist or can't be read, fall back to default prompt
-            console.log(`⚠️ Custom prompt file not found at: ${templatePath}. Using default prompt.`);
+        const templatePath = resolveFromCwd(cfg.promptPath);
+        try {
+            const template = (0, fs_1.readFileSync)(templatePath, "utf8");
+            console.log(`Using custom prompt template from: ${templatePath}`);
+            return template;
+        }
+        catch {
             core.warning(`Custom prompt file not found at: ${templatePath}. Using default prompt.`);
-            // Use the default prompt template
-            let template = defaultPromptTemplate;
-            // Replace placeholders with actual values - using global replacement
-            template = template
-                .replace(/\${filename}/g, file.to || '')
-                .replace(/\${title}/g, prDetails.title)
-                .replace(/\${description}/g, prDetails.description)
-                .replace(/\${diff_content}/g, chunk.content)
-                .replace(/\${diff_changes}/g, chunk.changes
-                // @ts-expect-error - ln and ln2 exists where needed
-                .map((c) => `${c.ln ? c.ln : c.ln2} ${c.content}`)
-                .join("\n"));
-            return { prompt: template };
         }
     }
-    catch (error) {
-        console.error(`Error in createPrompt:`, error);
-        throw new Error(`Failed to create prompt: ${error instanceof Error ? error.message : String(error)}`);
-    }
+    return language === "zh" ? exports.DEFAULT_PROMPT_ZH : exports.DEFAULT_PROMPT_EN;
 }
-async function getAIResponse(prompt) {
-    if (API_PROVIDER === "openai") {
-        return getOpenAIResponse(prompt);
-    }
-    else if (API_PROVIDER === "deepseek") {
-        try {
-            const deepseekResponse = await getDeepseekResponse(prompt);
-            if (deepseekResponse !== null) {
-                return deepseekResponse;
-            }
-            // If Deepseek API fails and OpenAI API key is available, try OpenAI as fallback
-            if (OPENAI_API_KEY) {
-                console.log("Deepseek API failed, falling back to OpenAI...");
-                return getOpenAIResponse(prompt);
-            }
-            return null;
-        }
-        catch (error) {
-            console.error("Error with Deepseek API, checking for fallback:", error);
-            // If OpenAI API key is available, try OpenAI as fallback
-            if (OPENAI_API_KEY) {
-                console.log("Falling back to OpenAI...");
-                return getOpenAIResponse(prompt);
-            }
-            return null;
-        }
-    }
-    else {
-        console.error(`Unsupported API provider: ${API_PROVIDER}`);
-        return null;
-    }
-}
-async function getOpenAIResponse(prompt) {
-    var _a, _b;
-    if (!openai) {
-        console.error("OpenAI client not initialized");
-        return null;
-    }
-    const queryConfig = {
-        model: OPENAI_API_MODEL,
-        temperature: 0.1,
-        max_tokens: 800,
-        top_p: 1,
-        frequency_penalty: 0,
-        presence_penalty: 0,
-    };
+exports.loadPromptTemplate = loadPromptTemplate;
+/** Load the optional style guide file; empty string when not configured. */
+function loadStyleGuide(cfg) {
+    if (!cfg.styleGuidePath)
+        return "";
+    const p = resolveFromCwd(cfg.styleGuidePath);
     try {
-        // Check if the model supports the JSON response format
-        const supportsJsonFormat = OPENAI_API_MODEL.includes("gpt-4-turbo") ||
-            OPENAI_API_MODEL.includes("gpt-4-0125") ||
-            OPENAI_API_MODEL.includes("gpt-4-1106") ||
-            OPENAI_API_MODEL.includes("gpt-3.5-turbo-1106");
-        const response = await openai.chat.completions.create({
-            ...queryConfig,
-            // Only add response_format if the model supports it
-            ...(supportsJsonFormat
-                ? { response_format: { type: "json_object" } }
-                : {}),
-            messages: [
-                {
-                    role: "system",
-                    content: "You are an expert technical writer who provides detailed, helpful documentation reviews in JSON format."
-                },
-                {
-                    role: "user",
-                    content: prompt
-                }
-            ]
-        });
-        const res = ((_b = (_a = response.choices[0].message) === null || _a === void 0 ? void 0 : _a.content) === null || _b === void 0 ? void 0 : _b.trim()) || "{}";
-        console.log("AI response:", res.substring(0, 100) + (res.length > 100 ? "..." : ""));
-        // Try several approaches to extract valid JSON
-        // First, try direct parsing
-        try {
-            const parsed = JSON.parse(res);
-            if (parsed.reviews && Array.isArray(parsed.reviews)) {
-                return parsed.reviews;
-            }
-            else {
-                console.log("Response doesn't contain valid reviews array:", res);
-            }
-        }
-        catch (parseError) {
-            console.error("Error parsing OpenAI response as JSON:", parseError);
-        }
-        // Second, look for JSON-like patterns in the response
-        try {
-            const jsonRegex = /\{(?:"reviews"|'reviews'):\s*\[(.*?)\]\}/s;
-            const match = res.match(jsonRegex);
-            if (match) {
-                const jsonString = match[0].replace(/'/g, '"');
-                const parsed = JSON.parse(jsonString);
-                if (parsed.reviews && Array.isArray(parsed.reviews)) {
-                    return parsed.reviews;
-                }
-            }
-        }
-        catch (regexParseError) {
-            console.error("Failed to extract JSON with regex:", regexParseError);
-        }
-        // Finally, try to extract from code blocks
-        try {
-            const codeBlockRegex = /```(?:json)?\s*(\{[\s\S]*?\})\s*```/;
-            const match = res.match(codeBlockRegex);
-            if (match && match[1]) {
-                const jsonString = match[1];
-                const parsed = JSON.parse(jsonString);
-                if (parsed.reviews && Array.isArray(parsed.reviews)) {
-                    return parsed.reviews;
-                }
-            }
-        }
-        catch (blockParseError) {
-            console.error("Failed to extract JSON from code block:", blockParseError);
-        }
-        console.error("All JSON parsing approaches failed");
-        return [];
+        const content = (0, fs_1.readFileSync)(p, "utf8");
+        console.log(`Using style guide from: ${p}`);
+        return `\nStyle guide to enforce:\n---\n${content}\n---\n`;
     }
-    catch (error) {
-        console.error("Error with OpenAI API:", error);
-        return [];
+    catch {
+        core.warning(`Style guide file not found at: ${p}. Continuing without it.`);
+        return "";
     }
 }
-async function getDeepseekResponse(prompt) {
-    var _a, _b, _c;
-    if (!DEEPSEEK_API_KEY) {
-        console.error("DEEPSEEK_API_KEY is not set");
-        return null;
-    }
-    //console.log("Calling Deepseek API...");
-    //console.log("Available Deepseek models: deepseek-chat, deepseek-coder");
-    const requestBody = {
-        model: DEEPSEEK_API_MODEL,
-        messages: [
-            {
-                role: "user",
-                content: prompt
-            }
-        ],
-        temperature: 0.2,
-        max_tokens: 800,
-        top_p: 1,
-        frequency_penalty: 0,
-        presence_penalty: 0
-    };
-    //console.log(`Using Deepseek model: ${DEEPSEEK_API_MODEL}`);
-    //console.log("Request body structure:", JSON.stringify({
-    //  model: DEEPSEEK_API_MODEL,
-    //  messages: [{role: "user", content: "prompt content (truncated)"}],
-    //  temperature: 0.2,
-    //  max_tokens: 800
-    //}));
-    const response = await fetch("https://api.deepseek.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${DEEPSEEK_API_KEY}`
-        },
-        body: JSON.stringify(requestBody)
-    });
-    if (!response.ok) {
-        const errorText = await response.text();
-        console.error(`Deepseek API error response: ${errorText}`);
-        throw new Error(`Deepseek API error: ${response.status} ${response.statusText}\nDetails: ${errorText}`);
-    }
-    const data = await response.json();
-    console.log("Deepseek API response received");
-    // Extract the content from the response
-    const content = (_c = (_b = (_a = data.choices) === null || _a === void 0 ? void 0 : _a[0]) === null || _b === void 0 ? void 0 : _b.message) === null || _c === void 0 ? void 0 : _c.content;
-    if (!content) {
-        console.error("No content in Deepseek response");
-        return null;
-    }
-    // Print the content and add a new line
-    console.log("Deepseek API response content:", content, "\n");
-    try {
-        // First attempt: try to parse the entire content as JSON
-        try {
-            const parsedJson = JSON.parse(content);
-            if (parsedJson && parsedJson.reviews) {
-                return parsedJson.reviews;
-            }
-        }
-        catch (parseError) {
-            console.error("Error parsing Deepseek response as JSON:", parseError);
-        }
-        // Second attempt: try to extract JSON from markdown code blocks
-        const jsonBlockRegex = /```(?:json)?\s*(\{[\s\S]*?\})\s*```/;
-        const jsonMatch = content.match(jsonBlockRegex);
-        if (jsonMatch && jsonMatch[1]) {
-            try {
-                const parsedJson = JSON.parse(jsonMatch[1]);
-                if (parsedJson && parsedJson.reviews) {
-                    return parsedJson.reviews;
-                }
-            }
-            catch (blockParseError) {
-                console.error("Failed to parse JSON block:", blockParseError);
-            }
-        }
-        console.error("Could not extract valid JSON from response");
-        return null;
-    }
-    catch (error) {
-        console.error("Error processing Deepseek response:", error);
-        return null;
-    }
+exports.loadStyleGuide = loadStyleGuide;
+/** Build the optional full-document section for a prompt. */
+function fullContentSection(fullContent) {
+    if (!fullContent)
+        return "";
+    return `\nFull document at the PR head (for context only; comment ONLY on lines that appear in the diff):\n---\n${fullContent}\n---\n`;
 }
-function createComment(file, chunk, aiResponses) {
-    if (!file.to)
-        return [];
-    const filePath = file.to;
-    console.log(`Processing file: ${filePath}`);
-    return aiResponses.map((aiResponse) => {
-        const lineNum = Number(aiResponse.lineNumber);
-        console.log(`Processing suggestion for line ${lineNum}`);
-        console.log(`Original suggestion: "${aiResponse.suggestion.substring(0, 100)}..."`);
-        // Check if the suggestion text already has leading whitespace
-        const suggestionHasLeadingSpace = aiResponse.suggestion.match(/^\s+/);
-        if (suggestionHasLeadingSpace) {
-            console.log(`Suggestion already has leading space: '${suggestionHasLeadingSpace[0].replace(/ /g, '·')}'`);
-            return {
-                body: `${aiResponse.reviewComment}\n\n\`\`\`\`suggestion\n${aiResponse.suggestion}\n\`\`\`\``,
-                path: filePath,
-                line: lineNum,
-            };
-        }
-        // Extract the original line indentation from the diff content
-        let originalIndent = '';
-        // Look for the line in the diff chunks
-        console.log(`Looking for line ${lineNum} in diff chunks`);
-        // Log all changes in the chunk for debugging
-        if (chunk.changes) {
-            console.log(`Chunk has ${chunk.changes.length} changes. Examining for indentation...`);
-            // Examine lines to find the correct indentation
-            for (const change of chunk.changes) {
-                // Get the line number from the change (ln for deletions, ln2 for additions or context)
-                // Use any type assertion to fix TS errors as parse-diff types are incomplete
-                const changeLine = change.ln || change.ln2;
-                // Only look at addition lines (starting with +) to get indentation
-                if (changeLine === lineNum && change.content.startsWith('+')) {
-                    console.log(`Found the exact line ${lineNum} in diff: "${change.content}"`);
-                    // Remove the + character before checking for indentation
-                    const contentWithoutDiffMarker = change.content.substring(1);
-                    console.log(`Content after removing diff marker: "${contentWithoutDiffMarker}"`);
-                    // Extract indentation from the line content after removing diff marker
-                    const indentMatch = contentWithoutDiffMarker.match(/^(\s+)/);
-                    if (indentMatch) {
-                        originalIndent = indentMatch[0];
-                        console.log(`Extracted indentation from diff: '${originalIndent.replace(/ /g, '·')}' (${originalIndent.length} spaces)`);
-                        break;
-                    }
-                    else {
-                        console.log(`Line ${lineNum} found in diff but has no leading whitespace after diff marker`);
-                    }
-                }
-            }
-        }
-        else {
-            console.log(`No changes found in chunk`);
-        }
-        // Apply indentation to suggestion text
-        let suggestionText = aiResponse.suggestion;
-        if (originalIndent) {
-            // If suggestion doesn't start with the original indentation, add it
-            if (!suggestionText.startsWith(originalIndent)) {
-                suggestionText = originalIndent + suggestionText.trimStart();
-                console.log(`Added indentation for line ${lineNum}. Result: '${suggestionText.substring(0, Math.min(50, suggestionText.length))}...'`);
-            }
-            else {
-                console.log(`Suggestion already has correct indentation, keeping as-is`);
-            }
-        }
-        else {
-            console.log(`No indent found for line ${lineNum}, using suggestion as-is`);
-        }
-        return {
-            body: `${aiResponse.reviewComment}\n\n\`\`\`\`suggestion\n${suggestionText}\n\`\`\`\``,
-            path: filePath,
-            line: lineNum,
-        };
-    });
+exports.fullContentSection = fullContentSection;
+/** Build the optional PR-wide digest section for a prompt. */
+function digestSection(digestText) {
+    if (!digestText)
+        return "";
+    return `\nPR-wide digest of all changes (for context; stay consistent with other changed files):\n---\n${digestText}\n---\n`;
 }
-async function createReviewComment(owner, repo, pull_number, comments) {
-    try {
-        await octokit.pulls.createReview({
-            owner,
-            repo,
-            pull_number,
-            comments,
-            event: "COMMENT",
-        });
-    }
-    catch (error) {
-        console.error("Error creating review comment:", error);
-        // If we get "Resource not accessible by integration" error, try to post a comment instead
-        if (error instanceof Error && error.message.includes("Resource not accessible by integration")) {
-            console.log("Permissions issue detected. Attempting to post a regular comment instead...");
-            const commentBody = `### AI Review Comments\n\n${comments.map(c => `**File:** ${c.path}, **Line:** ${c.line}\n${c.body}\n\n---\n`).join('\n')}`;
-            await octokit.issues.createComment({
-                owner,
-                repo,
-                issue_number: pull_number,
-                body: commentBody
-            });
+exports.digestSection = digestSection;
+
+
+/***/ }),
+
+/***/ 8506:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.mapPool = void 0;
+/**
+ * Run an async function over items with a bounded concurrency.
+ * Results keep the input order. Errors propagate to the caller
+ * (callers that need per-item isolation should catch inside `fn`).
+ */
+async function mapPool(items, limit, fn) {
+    const results = new Array(items.length);
+    let next = 0;
+    async function worker() {
+        while (next < items.length) {
+            const index = next++;
+            results[index] = await fn(items[index], index);
         }
-        else {
-            throw error;
-        }
     }
+    const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, () => worker());
+    await Promise.all(workers);
+    return results;
 }
-// Helper function to get the line number from a change
-function getChangeLineNumber(change, lineNumber) {
-    if (change.type === 'add' && change.ln === lineNumber) {
-        return true;
-    }
-    else if (change.type === 'normal' && change.ln2 === lineNumber) {
-        return true;
-    }
-    else if (change.type === 'del' && change.ln === lineNumber) {
-        return true;
-    }
-    return false;
-}
-async function main() {
-    var _a;
-    try {
-        // Validate API provider configuration
-        if (API_PROVIDER === "openai" && !OPENAI_API_KEY) {
-            core.setFailed("OPENAI_API_KEY is required when API_PROVIDER is set to 'openai'");
-            return;
-        }
-        if (API_PROVIDER === "deepseek" && !DEEPSEEK_API_KEY) {
-            core.setFailed("DEEPSEEK_API_KEY is required when API_PROVIDER is set to 'deepseek'");
-            return;
-        }
-        const prDetails = await getPRDetails();
-        let diff;
-        const eventData = JSON.parse((0, fs_1.readFileSync)((_a = process.env.GITHUB_EVENT_PATH) !== null && _a !== void 0 ? _a : "", "utf8"));
-        // Check if the comment is triggered
-        const isCommentTrigger = process.env.GITHUB_EVENT_NAME === "issue_comment";
-        if (isCommentTrigger) {
-            const commentUser = eventData.comment.user.login;
-            console.log("REVIEW_MODE from input:", REVIEW_MODE);
-            console.log("COMMIT_SHA from input:", COMMIT_SHA);
-            console.log("BASE_SHA from input:", BASE_SHA);
-            console.log("HEAD_SHA from input:", HEAD_SHA);
-            console.log("Raw comment body:", eventData.comment.body);
-            // Handle invalid review mode
-            if (REVIEW_MODE === "invalid") {
-                console.log("Invalid bot-review command format detected");
-                await octokit.issues.createComment({
-                    owner: prDetails.owner,
-                    repo: prDetails.repo,
-                    issue_number: prDetails.pull_number,
-                    body: `❌ Invalid command format. Valid formats are:
-- \`/bot-review\` - Review latest changes
-- \`/bot-review: <commit-sha>\` - Review a single commit
-- \`/bot-review: <base>..<head>\` - Review a commit range`
-                });
-                return;
-            }
-            // Get diff based on the comment content
-            if (REVIEW_MODE === "single_commit" && COMMIT_SHA) {
-                // Get the diff of a single commit
-                console.log(`Reviewing single commit: ${COMMIT_SHA}`);
-                try {
-                    const response = await octokit.repos.getCommit({
-                        owner: prDetails.owner,
-                        repo: prDetails.repo,
-                        ref: COMMIT_SHA,
-                        mediaType: { format: "diff" }
-                    });
-                    // @ts-expect-error - response.data is a string
-                    diff = response.data;
-                }
-                catch (error) {
-                    handleGitHubPermissionError(error, prDetails, isCommentTrigger);
-                    throw error;
-                }
-            }
-            else if (REVIEW_MODE === "commit_range" && BASE_SHA) {
-                // Process commit range
-                console.log("Processing commit range mode");
-                // Get base and head SHAs
-                let baseSha = BASE_SHA;
-                let headSha = HEAD_SHA;
-                // Check if BASE_SHA contains full range format (like "sha1..sha2")
-                if (BASE_SHA.includes('..')) {
-                    const parts = BASE_SHA.split('..');
-                    baseSha = parts[0];
-                    headSha = parts.length > 1 ? parts[1] : HEAD_SHA;
-                    console.log(`BASE_SHA contains '..' pattern, extracted baseSha=${baseSha}, headSha=${headSha}`);
-                }
-                else {
-                    console.log(`Using separate BASE_SHA and HEAD_SHA values: base=${baseSha}, head=${headSha}`);
-                }
-                // Trim any whitespace that might have been included in the SHAs
-                baseSha = baseSha.trim();
-                headSha = headSha.trim();
-                if (!baseSha || !headSha) {
-                    throw new Error(`Invalid commit range: ${baseSha}..${headSha}`);
-                }
-                console.log(`Comparing commit range: ${baseSha} → ${headSha}`);
-                try {
-                    console.log(`Calling GitHub API to compare commits - owner: ${prDetails.owner}, repo: ${prDetails.repo}`);
-                    const response = await octokit.repos.compareCommits({
-                        owner: prDetails.owner,
-                        repo: prDetails.repo,
-                        base: baseSha,
-                        head: headSha,
-                        headers: {
-                            accept: "application/vnd.github.v3.diff",
-                        }
-                    });
-                    if (!response.data) {
-                        throw new Error("Empty response from GitHub API");
-                    }
-                    diff = typeof response.data === 'string' ? response.data : String(response.data);
-                    console.log("Diff length:", diff.length);
-                    console.log("Diff preview (first 200 chars):", diff.substring(0, 200));
-                    console.log("Number of files changed in diff:", (diff.match(/^diff --git/gm) || []).length);
-                    // Debug - log the file paths in the diff
-                    const fileMatches = diff.match(/^diff --git a\/(.*?) b\/(.*?)$/gm);
-                    if (fileMatches) {
-                        console.log("Files in diff:", fileMatches.map(m => m.replace(/^diff --git a\/.*? b\//, '')).slice(0, 10).join(', ') +
-                            (fileMatches.length > 10 ? ` and ${fileMatches.length - 10} more...` : ''));
-                    }
-                }
-                catch (apiError) {
-                    handleGitHubPermissionError(apiError, prDetails, isCommentTrigger);
-                    console.error("Error calling GitHub API:", apiError);
-                    throw new Error(`Failed to get diff from GitHub API: ${apiError instanceof Error ? apiError.message : String(apiError)}`);
-                }
-            }
-            else {
-                // Get the diff of the latest PR changes
-                console.log("Reviewing latest PR changes");
-                try {
-                    diff = await getDiff(prDetails.owner, prDetails.repo, prDetails.pull_number);
-                    if (!diff) {
-                        throw new Error("No diff returned from GitHub API");
-                    }
-                }
-                catch (diffError) {
-                    handleGitHubPermissionError(diffError, prDetails, isCommentTrigger);
-                    console.error("Error getting PR diff:", diffError);
-                    throw diffError;
-                }
-            }
-        }
-        else if (eventData.action === "opened") {
-            try {
-                diff = await getDiff(prDetails.owner, prDetails.repo, prDetails.pull_number);
-            }
-            catch (error) {
-                handleGitHubPermissionError(error, prDetails, isCommentTrigger);
-                throw error;
-            }
-        }
-        else if (eventData.action === "synchronize") {
-            const newBaseSha = eventData.before;
-            const newHeadSha = eventData.after;
-            try {
-                const response = await octokit.repos.compareCommits({
-                    headers: {
-                        accept: "application/vnd.github.v3.diff",
-                    },
-                    owner: prDetails.owner,
-                    repo: prDetails.repo,
-                    base: newBaseSha,
-                    head: newHeadSha,
-                });
-                diff = String(response.data);
-            }
-            catch (error) {
-                handleGitHubPermissionError(error, prDetails, isCommentTrigger);
-                throw error;
-            }
-        }
-        else {
-            console.log("Unsupported event:", process.env.GITHUB_EVENT_NAME);
-            return;
-        }
-        if (!diff || typeof diff !== 'string' || diff.trim() === '') {
-            console.error("Empty or invalid diff returned from GitHub API");
-            throw new Error("Failed to retrieve diff from GitHub API");
-        }
-        const parsedDiff = (0, parse_diff_1.default)(diff);
-        if (!parsedDiff || parsedDiff.length === 0) {
-            console.error("Failed to parse diff:", diff);
-            throw new Error("Failed to parse diff from GitHub API");
-        }
-        const excludePatterns = core
-            .getInput("exclude")
-            .split(",")
-            .map((s) => s.trim());
-        const filteredDiff = parsedDiff.filter((file) => {
-            return !excludePatterns.some((pattern) => { var _a; return (0, minimatch_1.default)((_a = file.to) !== null && _a !== void 0 ? _a : "", pattern); });
-        });
-        if (filteredDiff.length === 0) {
-            console.log("No files to review after filtering");
-            if (isCommentTrigger) {
-                await octokit.issues.createComment({
-                    owner: prDetails.owner,
-                    repo: prDetails.repo,
-                    issue_number: prDetails.pull_number,
-                    body: `✅ AI review completed, no files to review after filtering.`
-                });
-            }
-            return;
-        }
-        // Track if we had critical errors that should fail the action
-        let hadCriticalErrors = false;
-        try {
-            const comments = await analyzeCode(filteredDiff, prDetails);
-            if (comments.length > 0) {
-                try {
-                    await createReviewComment(prDetails.owner, prDetails.repo, prDetails.pull_number, comments);
-                    // If the comment is triggered, reply a comment to indicate the completion
-                    if (isCommentTrigger) {
-                        await octokit.issues.createComment({
-                            owner: prDetails.owner,
-                            repo: prDetails.repo,
-                            issue_number: prDetails.pull_number,
-                            body: `✅ AI review completed, ${comments.length} comments generated.`
-                        });
-                    }
-                }
-                catch (reviewError) {
-                    hadCriticalErrors = true;
-                    console.error("Error creating review comments:", reviewError);
-                    // If this is a permissions issue, we have already tried the fallback in createReviewComment
-                    if (!(reviewError instanceof Error && reviewError.message.includes("Resource not accessible by integration"))) {
-                        throw reviewError;
-                    }
-                }
-            }
-            else {
-                // If the comment is triggered but no comments are generated, also reply a message
-                if (isCommentTrigger) {
-                    await octokit.issues.createComment({
-                        owner: prDetails.owner,
-                        repo: prDetails.repo,
-                        issue_number: prDetails.pull_number,
-                        body: `✅ AI review completed, no issues found.`
-                    });
-                }
-            }
-        }
-        catch (analyzeError) {
-            hadCriticalErrors = true;
-            if (analyzeError instanceof Error) {
-                core.setFailed(`Critical error during analysis: ${analyzeError.message}`);
-                // If the comment is triggered, reply the error information
-                if (isCommentTrigger) {
-                    await octokit.issues.createComment({
-                        owner: prDetails.owner,
-                        repo: prDetails.repo,
-                        issue_number: prDetails.pull_number,
-                        body: `❌ AI review failed: ${analyzeError.message}`
-                    });
-                }
-            }
-            else {
-                core.setFailed(`Unknown critical error during analysis: ${analyzeError}`);
-                // If the comment is triggered, reply the error information
-                if (isCommentTrigger) {
-                    await octokit.issues.createComment({
-                        owner: prDetails.owner,
-                        repo: prDetails.repo,
-                        issue_number: prDetails.pull_number,
-                        body: `❌ AI review failed: Unknown error`
-                    });
-                }
-            }
-        }
-        // Only report success if we didn't have critical errors
-        if (!hadCriticalErrors) {
-            core.info("AI Review completed successfully");
-        }
-    }
-    catch (error) {
-        // Log the error details
-        if (error instanceof Error) {
-            core.setFailed(`Error in AI Review: ${error.message}`);
-            console.error("Error details:", error.stack);
-        }
-        else {
-            core.setFailed(`Unknown error in AI Review: ${error}`);
-            console.error("Unknown error:", error);
-        }
-        // Ensure the process exits with a non-zero status code
-        process.exit(1);
-    }
-}
-// Helper function to handle GitHub permission errors
-function handleGitHubPermissionError(error, prDetails, isCommentTrigger) {
-    if (error instanceof Error && error.message.includes("Resource not accessible by integration")) {
-        console.log("GitHub permission error detected. Checking if we can notify the user...");
-        if (isCommentTrigger) {
-            try {
-                octokit.issues.createComment({
-                    owner: prDetails.owner,
-                    repo: prDetails.repo,
-                    issue_number: prDetails.pull_number,
-                    body: `❌ Review failed: Insufficient permissions to access repository data. Please check the GitHub token permissions and make sure it has access to the repository contents and pull requests.`
-                }).catch(commentError => {
-                    console.error("Also failed to post error comment:", commentError);
-                });
-            }
-            catch (commentError) {
-                console.error("Failed to post permission error comment:", commentError);
-            }
-        }
-        return true;
-    }
-    return false;
-}
-main().catch((error) => {
-    console.error("Error:", error);
-    core.setFailed(`Unhandled error in AI Review: ${error}`);
-    process.exit(1);
-});
+exports.mapPool = mapPool;
 
 
 /***/ }),

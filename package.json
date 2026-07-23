@@ -9,7 +9,8 @@
     "build": "tsc",
     "package": "ncc build --source-map --license licenses.txt",
     "format": "prettier --write .",
-    "lint": "prettier --check ."
+    "lint": "prettier --check .",
+    "test": "vitest run"
   },
   "dependencies": {
     "@actions/core": "^1.10.0",
@@ -20,9 +21,10 @@
     "ts-node": "^10.9.1"
   },
   "devDependencies": {
-    "@types/node": "^18.15.5",
+    "@types/node": "^20.19.43",
     "@vercel/ncc": "^0.36.1",
     "prettier": "^2.8.6",
-    "typescript": "^5.0.2"
+    "typescript": "^5.0.2",
+    "vitest": "^4.1.10"
   }
 }

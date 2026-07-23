@@ -1,29 +1,33 @@
-name: "AI Code Review Action"
-description: "Perform code reviews and comment on diffs using OpenAI or Deepseek API."
+name: "AI Doc Review Action"
+description: "Review documentation pull requests and comment on diffs using OpenAI or Deepseek API."
 inputs:
   GITHUB_TOKEN:
     description: "GitHub token to interact with the repository."
     required: true
   API_PROVIDER:
-    description: "API provider to use for code review (openai or deepseek)."
+    description: "API provider to use for documentation review (openai or deepseek)."
     required: false
     default: "openai"
   OPENAI_API_KEY:
     description: "OpenAI API key for GPT (required if API_PROVIDER is openai)."
     required: false
   OPENAI_API_MODEL:
-    description: "OpenAI API model."
+    description: "OpenAI model used for the review and cross-check stages."
     required: false
     default: ""
   DEEPSEEK_API_KEY:
     description: "Deepseek API key (required if API_PROVIDER is deepseek)."
     required: false
   DEEPSEEK_API_MODEL:
-    description: "Deepseek API model."
+    description: "Deepseek model used for the review and cross-check stages."
+    required: false
+    default: ""
+  FAST_MODEL:
+    description: "Cheaper model for the digest and verify stages. Defaults to the main model."
     required: false
     default: ""
   exclude:
-    description: "Glob patterns to exclude files from the diff analysis"
+    description: "Comma-separated glob patterns to exclude files from the analysis"
     required: false
     default: ""
   REVIEW_MODE:
@@ -46,8 +50,44 @@ inputs:
     description: "Path to the review prompt template file"
     required: false
     default: ""
+  STYLE_GUIDE_PATH:
+    description: "Path to a style guide file injected into every review prompt"
+    required: false
+    default: ""
+  GLOSSARY_PATH:
+    description: "Path to a terminology file for deterministic term linting ('preferred: banned1, banned2' per line)"
+    required: false
+    default: ""
+  CHECKS:
+    description: "Comma-separated deterministic checks to run: anchors, links, images, terms, toc, typography, code"
+    required: false
+    default: "anchors,links,images,typography"
+  DOC_LANGUAGE:
+    description: "Force the documentation language for all files (e.g. en, zh, ja, fr). Default: auto-detect per file"
+    required: false
+    default: ""
+  TOC_PATH:
+    description: "Glob pattern of the docs navigation file (e.g. 'TOC.md') for the toc check"
+    required: false
+    default: ""
+  CODE_REPO:
+    description: "Source repository ('owner/repo', e.g. 'pingcap/tidb') used by the code check to verify CLI flags"
+    required: false
+    default: ""
+  MAX_FILE_KB:
+    description: "Files larger than this (KB) are reviewed from diff hunks only, without full-document context"
+    required: false
+    default: "50"
+  MAX_TOKENS:
+    description: "Max output tokens per LLM call (doubled automatically on truncation)"
+    required: false
+    default: "4096"
+  CONCURRENCY:
+    description: "Number of files reviewed in parallel"
+    required: false
+    default: "4"
 runs:
-  using: "node16"
+  using: "node20"
   main: "dist/index.js"
 branding:
   icon: "aperture"
